@@ -1,0 +1,25 @@
+[project]
+name = "replay"
+version = "0.1.0"
+description = "Replay: reproducible robot failures on Vultr"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+# VM A: control plane + web app
+control = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "asyncpg>=0.29", "httpx>=0.27"]
+# VM B: live sim + fleet API + replay workers
+sim = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "httpx>=0.27"]
+
+[dependency-groups]
+dev = ["pytest>=8", "fastapi>=0.115", "httpx>=0.27", "asyncpg>=0.29"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["replay_core", "control", "simnode"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
