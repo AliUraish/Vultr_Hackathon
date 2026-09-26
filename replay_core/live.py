@@ -8,7 +8,7 @@ The network service on VM B wraps this; tests drive it directly.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .engine import make_frame, step
 from .hashing import clone
@@ -32,6 +32,16 @@ class ChaosRequest:
     id: str
     scenario: str
     expires: int
+    hints: dict = field(default_factory=dict)
+    created: int = 0
+
+    def effective_hints(self, tick: int) -> dict:
+        hints = dict(self.hints)
+        fallback = hints.pop("fallback_zone", None)
+        after = hints.pop("fallback_after", 0)
+        if fallback and tick - self.created >= after:
+            hints["zone"] = fallback
+        return hints
 
 
 class LiveSim:
@@ -57,8 +67,9 @@ class LiveSim:
         self._queue.append(inp)
         return inp["id"]
 
-    def request_chaos(self, scenario: str, wait_ticks: int = 300) -> str:
-        req = ChaosRequest(self._next_id("chaos"), scenario, self.tick_no + wait_ticks)
+    def request_chaos(self, scenario: str, wait_ticks: int = 300, hints: dict | None = None) -> str:
+        req = ChaosRequest(self._next_id("chaos"), scenario, self.tick_no + wait_ticks, dict(hints or {}),
+                           self.tick_no)
         self._chaos.append(req)
         return req.id
 
@@ -68,7 +79,7 @@ class LiveSim:
         inputs, self._queue = self._queue, []
         pending: list[ChaosRequest] = []
         for req in self._chaos:
-            got = resolve(self.state, req.scenario)
+            got = resolve(self.state, req.scenario, req.effective_hints(t))
             if got:
                 for g in got:
                     g["id"] = self._next_id("in")
