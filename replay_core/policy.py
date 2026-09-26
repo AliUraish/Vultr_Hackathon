@@ -7,6 +7,7 @@ A policy is an ordered list of rules. Each rule is one fix from a closed set:
     reroute_avoid(<zone> | c<x>_<y>)    path planner avoids these cells when it can
     reorder_steps(<job kind>, <strategy>)  pick order for jobs of a kind
     require_scan_confirm(<item class> | *) scan the bin before picking
+    respect_closures(<zone> | *)        re-plan when a zone closes; never drive into a closed zone
 
 Rules from the diagnosis agent are parsed and validated here before anything
 runs them; nothing in a rule is ever evaluated as code.
@@ -22,6 +23,7 @@ from .world import DEFAULT_CLEARANCE, ITEM_CLASSES, MAX_SPEED, TICK_HZ, W
 
 FIX_TYPES: tuple[str, ...] = (
     "speed_cap", "min_clearance", "reroute_avoid", "reorder_steps", "require_scan_confirm",
+    "respect_closures",
 )
 JOB_KINDS: tuple[str, ...] = ("single", "multi", "*")
 STRATEGIES: tuple[str, ...] = ("nearest_first", "farthest_first", "as_given")
@@ -112,6 +114,11 @@ def parse_rule(text: str) -> Rule:
         if args[1] not in STRATEGIES:
             raise PolicyError(f"strategy must be one of {', '.join(STRATEGIES)}")
         return Rule(name, args)
+    if name == "respect_closures":
+        need(1)
+        if args[0] != "*" and args[0] not in W.zones:
+            raise PolicyError(f"zone must be * or one of {', '.join(sorted(W.zones))}")
+        return Rule(name, args)
     need(1)  # require_scan_confirm
     if args[0] != "*" and args[0] not in ITEM_CLASSES:
         raise PolicyError(f"item class must be * or one of {', '.join(ITEM_CLASSES)}")
@@ -129,6 +136,7 @@ def compile_rules(rules: list[str]) -> dict:
     avoid: set[tuple[int, int]] = set()
     scan: set[str] = set()
     reorder: dict[str, str] = {}
+    closures: set[str] = set()
     for text in rules:
         rule = parse_rule(text)
         a = rule.args
@@ -141,15 +149,20 @@ def compile_rules(rules: list[str]) -> dict:
             avoid |= {(c[0], c[1]) for c in _target_cells(a[0])}
         elif rule.name == "reorder_steps":
             reorder[a[0]] = a[1]
+        elif rule.name == "respect_closures":
+            closures.add(a[0])
         else:
             scan.add(a[0])
-    return {
+    out = {
         "caps": dict(sorted(caps.items())),
         "clearance": clearance,
         "avoid": [list(c) for c in sorted(avoid)],
         "scan": sorted(scan),
         "reorder": dict(sorted(reorder.items())),
     }
+    if closures:  # only present when used, so policies without it hash exactly as before
+        out["closures"] = sorted(closures)
+    return out
 
 
 def make_policy(rules: list[str], version: int) -> dict:
