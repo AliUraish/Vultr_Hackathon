@@ -28,8 +28,10 @@ async def create_job(rt: Runtime, slots: list[str], dock: str, source: str) -> d
     if not 1 <= len(slots) <= 3:
         raise JobError("a job picks 1 to 3 slots")
     bad = [s for s in slots if s not in W.slots]
-    if bad or dock not in W.docks:
-        raise JobError(f"unknown slot(s) {bad} or dock {dock!r}")
+    if bad:
+        raise JobError(f"unknown slot {', '.join(bad)}: slots are A1-F8")
+    if dock not in W.docks:
+        raise JobError(f"unknown dock {dock}: docks are {', '.join(sorted(W.docks))}")
     lines = [{"slot": s, "sku": W.slots[s]["sku"], "cls": W.slots[s]["cls"]} for s in slots]
     kind = "multi" if len(lines) > 1 else "single"
     async with rt.pool.acquire() as c, c.transaction():
