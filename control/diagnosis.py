@@ -53,7 +53,9 @@ def context(capsule: dict, failure: dict, events: list[dict], policy_rules: list
     speeds = [_mps(next(r["v"] for r in f["robots"] if r["id"] == target["robot"])) for f in recent]
     world_events = [
         {"tick": t, **{k: v for k, v in i.items() if k in ("type", "scenario", "cell", "slot", "sku", "zone", "ticks")},
-         **({"slot_item_class": W.slots[i["slot"]]["cls"]} if i.get("slot") in W.slots else {})}
+         **({"slot_item_class": W.slots[i["slot"]]["cls"]} if i.get("slot") in W.slots else {}),
+         **({"appeared_m_ahead_of_robot": round(i["gap_mm"] / 1000, 2), "robot": i.get("target"),
+             "robot_speed_mps": _mps(i.get("v", 0))} if isinstance(i.get("gap_mm"), int) else {})}
         for t, ins in capsule["inputs"] for i in ins if i.get("kind") == "chaos"
     ]
     return {
@@ -143,10 +145,16 @@ def playbook(ctx: dict) -> list[dict]:
         zone = detail.get("zone")
         if zone:
             out.append((
-                f"{rid} was already routed through {zone} when it was closed, and robots do not re-plan "
-                "an existing route when an aisle closes.",
+                f"{rid} was already routed through {zone} when a worker closed it, and robots do not "
+                "re-check an existing route when an aisle closes.",
+                f"respect_closures({zone if not zone.startswith('aisle_') else 'racks'})",
+                "Re-plan when an aisle closes and wait outside it; covers robots passing through and "
+                "robots whose pick is inside.",
+            ))
+            out.append((
+                f"{rid}'s route went through {zone}; keeping traffic out of it avoids the conflict.",
                 f"reroute_avoid({zone})",
-                f"Route around {zone} whenever there is another way.",
+                f"Route around {zone} whenever there is another way (does not help robots picking in it).",
             ))
             out.append((
                 f"{rid} entered {zone} too fast to stop at the boundary.",
@@ -231,11 +239,15 @@ one fix, written as one rule in this DSL and nothing else:
   reroute_avoid(<zone> | c<x>_<y>)
   reorder_steps(<{'|'.join(JOB_KINDS)}>, <{'|'.join(STRATEGIES)}>)
   require_scan_confirm(<item class> | *)
+  respect_closures(<zone> | *)   robots re-plan when a zone closes and never drive into a closed zone
 Zones: {', '.join(sorted(W.zones))}. "racks" is every rack aisle; aisle_<row><W|E> is one aisle.
 Item classes: {', '.join(ITEM_CLASSES)}. Racks A-B hold boxed, C-D loose_small, E fragile, F heavy
 items; a slot id is rack letter + number (e.g. D8).
 Rank first the fix that would also prevent similar failures elsewhere at the least cost to throughput:
-a zone rule over a single cell, a targeted item class over *, unless the evidence says otherwise.
+the widest zone where the same hazard exists over one aisle or cell (a pallet can fall into any rack
+aisle, so "racks" beats a single aisle), a targeted item class over *, unless the evidence says otherwise.
+A speed cap only prevents a collision with a suddenly appearing obstacle if the robot can stop within the
+distance at which it appeared: stopping distance is about v^2 / 2 m at 1 m/s^2 plus 0.1 s of travel.
 Robots move up to 1.2 m/s, brake at 1 m/s^2 and sense obstacles {SENSOR_RANGE / 1000} m ahead.
 Do not repeat a rule that is already in current_policy. Ground every cause in the capsule evidence.
 Answer with only this JSON, no prose:
