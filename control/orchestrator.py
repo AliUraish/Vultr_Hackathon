@@ -35,6 +35,29 @@ class WorkflowError(ValueError):
     pass
 
 
+CAUSES = {"collision": "pallet_drop", "wrong_item": "mislabel_bin", "zone_breach": "worker_in_aisle"}
+
+
+async def original_chaos(c: asyncpg.Connection, run_id: str, fail_type: str, fail_tick: int,
+                         capsule_inputs: list | None) -> dict | None:
+    """The canned-scenario input behind a failure: from the capsule, else the event log (the cause
+    can predate the capsule window, e.g. a bin mislabeled long before the wrong item reached a dock)."""
+    want = CAUSES.get(fail_type)
+    chaos = [i for _, ins in (capsule_inputs or []) for i in ins
+             if i.get("kind") == "chaos" and i.get("scenario") not in (None, "clear_floor")]
+    match = next((i for i in reversed(chaos) if i.get("scenario") == want), None)
+    if match:
+        return match
+    if want:
+        found = await c.fetchval(
+            "SELECT payload FROM events WHERE run_id = $1 AND type = 'input.chaos' AND tick <= $2 "
+            "AND tick >= $2 - 6000 AND payload->>'scenario' = $3 ORDER BY tick DESC LIMIT 1",
+            run_id, fail_tick, want)
+        if found:
+            return found
+    return chaos[-1] if chaos else None
+
+
 class Orchestrator:
     def __init__(self, rt: Runtime) -> None:
         self.rt = rt
@@ -156,10 +179,9 @@ class Orchestrator:
             async with pool.acquire() as c, c.transaction():
                 await self._status(c, f, "lost", str(exc))
             return
-        chaos = [i.get("scenario") for _, ins in blob["inputs"] for i in ins
-                 if i.get("kind") == "chaos" and i.get("scenario") not in (None, "clear_floor")]
-        causes = {"collision": "pallet_drop", "wrong_item": "mislabel_bin", "zone_breach": "worker_in_aisle"}
-        scenario = causes.get(f["type"]) if causes.get(f["type"]) in chaos else (chaos[-1] if chaos else None)
+        async with pool.acquire() as c:
+            cause = await original_chaos(c, f["run_id"], f["type"], f["tick"], blob["inputs"])
+        scenario = cause.get("scenario") if cause else None
         size = len(json.dumps(blob))
         async with pool.acquire() as c, c.transaction():
             cid = await c.fetchval(
@@ -215,7 +237,7 @@ class Orchestrator:
                 cur = await policies.current(c)
             ctx = diagnosis.context(k["blob"], dict(f), [dict(e) for e in reversed(events)], list(cur["rules"]))
             hyps, source, notes = await diagnosis.diagnose(self.rt.settings, ctx)
-            recorded = list(k["blob"]["policy"]["rules"])
+            recorded = caps.policy_at(k["blob"], f["tick"])  # what the fleet ran when it failed
             async with pool.acquire() as c, c.transaction():
                 rnd = (await c.fetchval("SELECT max(round) FROM hypotheses WHERE capsule_id = $1", k["id"]) or 0) + 1
                 await c.execute("UPDATE hypotheses SET status = 'superseded' WHERE capsule_id = $1 "
