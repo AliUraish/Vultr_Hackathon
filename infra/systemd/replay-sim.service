@@ -1,0 +1,20 @@
+[Unit]
+Description=Replay live fleet sim + fleet API, VM B
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=replay
+Group=replay
+WorkingDirectory=/opt/replay
+EnvironmentFile=/etc/replay/sim.env
+ExecStart=/opt/replay/.venv/bin/python -m uvicorn simnode.app:app --host 0.0.0.0 --port 8100 --no-access-log
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

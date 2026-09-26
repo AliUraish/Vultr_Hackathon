@@ -1,0 +1,20 @@
+[Unit]
+Description=Replay worker %i, VM B
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=replay
+Group=replay
+WorkingDirectory=/opt/replay
+EnvironmentFile=/etc/replay/sim.env
+ExecStart=/opt/replay/.venv/bin/python -m simnode.worker --id %H-w%i
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
