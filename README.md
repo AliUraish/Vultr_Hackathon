@@ -30,20 +30,25 @@ Browser (ops app) ◄── WebSocket ──► VM A · control plane (FastAPI +
 
 The sim (`replay_core/`) is pure integer math (millimetres, ticks) over a JSON-only state, with a seeded SplitMix64 RNG stored in that state. Every external input (job commands, chaos, policy changes) is recorded with the tick it was applied on, and replays feed the recorded inputs back without ever re-sensing. A reproduction must match the live run's per-tick state hash, tick for tick. This is tested across processes with different hash seeds (`tests/test_determinism.py`).
 
-A capsule is a snapshot from before the failure, plus every input through T+2 s, plus the live hashes. It reaches back to the failing job's start (up to 60 s), so the cause is always inside it. Fix trials simulate 40 s past the capsule and compare against a control run, so a fix that only delays a failure isn't counted as preventing it.
+A capsule is a snapshot from before the failure, plus every input through T+2 s, plus the live hashes. It reaches back to the failing job's start (up to 60 s), so the cause is always inside it. Fix trials start from the policy the fleet was running at the failure, simulate 40 s past the capsule, and compare against a control run, so a fix that only delays a failure isn't counted as preventing it. A new safety failure (collision, wrong item, zone breach), or any new failure inside the recorded window, blocks a fix; a stall or overdue job that only appears in the 40 s continuation is shown to the approver as a warning.
 
 ## Numbers (from the test suite and scenario runs)
 
 - Reproduction: every capsule replays hash-identical to live, 3/3, in 50–100 ms per replay.
-- Three canned failures, 8 random runs each. The right fix is proven to avoid the failure in 22/23; a wrong fix is rejected in 20/23. The misses are genuine timing side effects, not verdict errors.
+- Three canned failures, 8 random runs each: the right fix is proven to avoid the failure in 23/23; a wrong fix is rejected in 20/23 (the misses are genuine timing side effects, not verdict errors).
+- Replays are exact across machines: a capsule recorded on VM B (Intel x86, Python 3.12) replays hash-identical on an Apple M4 (ARM, Python 3.11).
 - Normal operation: 497 jobs in 100 fleet-minutes, all delivered correctly, with 3 organic failures.
-- Live LLM check (OpenAI `gpt-5.6-sol`, one call per failure, 10 s each): for all three canned failures the top-ranked hypothesis was the fix the replays prove, and the plausible-but-wrong alternatives were rejected by their forked replays.
+- Live end to end on Vultr with OpenAI diagnosis (`scripts/e2e.py`): all three scenarios go failure → 3/3 exact reproduction → hypotheses → forked trials → approval → fleet hot-reload → clean proof replay → **re-inject the original situation live, and the failure does not recur**.
 
 | Scenario | Failure | Fix the agent should find |
 |---|---|---|
 | Pallet falls ahead of a fast robot | collision | `speed_cap(racks, 0.5)` |
 | Bin gets the wrong item | wrong item at the dock | `require_scan_confirm(<class>)` |
-| Worker closes an aisle a robot is routed through | zone breach | `reroute_avoid(<aisle>)` |
+| Worker closes an aisle a robot is routed through | zone breach | `respect_closures(racks)` |
+
+The fix language has six rule types: `speed_cap`, `min_clearance`, `reroute_avoid`, `reorder_steps` and `require_scan_confirm` come from the plan. `respect_closures` (re-plan when an aisle closes; never drive into a closed one) was added after live testing showed that routing around a closed aisle can't stop a robot whose pick is inside it.
+
+"Re-inject live" recreates the original situation rather than a random one: the same aisle and the same gap for a pallet (any rack aisle after 30 s), the same item class for a mislabeled bin, the same aisle for a worker.
 
 ## Repo
 
