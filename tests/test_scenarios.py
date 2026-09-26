@@ -27,7 +27,7 @@ def right_fix(case: Case, failure: dict, d: Driver) -> list[str]:
     if case.scenario == "pallet_drop":
         return ["speed_cap(racks, 0.5)"]
     if case.scenario == "worker_in_aisle":
-        return [f"reroute_avoid({failure['detail']['zone']})"]
+        return ["respect_closures(racks)"]
     slot = next(e["slot"] for e in d.events if e["type"] == "bin_mislabeled")
     return [f"require_scan_confirm({W.slots[slot]['cls']})"]
 
