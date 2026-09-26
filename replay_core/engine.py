@@ -214,6 +214,12 @@ def _apply_chaos(st: State, inp: dict, ev: list[Event]) -> None:
         st["restricted"] = [z for z in st["restricted"] if z["zone"] != zone]
         st["restricted"].append({"zone": zone, "until": until})
         ev.append({"type": "zone_restricted", "zone": zone, "until": until})
+        for rid in sorted(st["robots"]):
+            r = st["robots"][rid]
+            if r["step"] is not None and r["step"]["op"] == "goto" and r["path"]:
+                closed = _closed_cells(st, r)
+                if closed and any(_t(c) in closed for c in r["path"][r["k"]:]):
+                    r["replan"] = True
     elif typ == "lift_zones":
         st["restricted"] = []
         ev.append({"type": "zones_lifted"})
@@ -439,6 +445,24 @@ def _restricted_cells(st: State) -> set[Cell]:
     return out
 
 
+_CLOSED = "#closed"  # _reserve's marker: the way ahead is a zone closed under respect_closures
+
+
+def _closed_cells(st: State, r: dict) -> set[Cell]:
+    """Closed-zone cells this robot must not enter (respect_closures); zones it is already in excepted."""
+    rules = st["policy"]["c"].get("closures")
+    if not rules or not st["restricted"]:
+        return set()
+    out: set[Cell] = set()
+    for z in st["restricted"]:
+        cells = {_t(c) for c in W.zones.get(z["zone"], [])}
+        if z["zone"] in r["zones"]:
+            continue
+        if "*" in rules or z["zone"] in rules or any(cells <= {_t(c) for c in W.zones.get(n, [])} for n in rules):
+            out |= cells
+    return out
+
+
 def _learn_obstacle(st: State, cell: list[int]) -> None:
     """Fleet-wide obstacle map: once any robot senses a pallet, every robot routes around it."""
     if cell in st["known"]:
@@ -549,13 +573,15 @@ def _trim_res(r: dict, occ: dict[Cell, str]) -> None:
     r["res"] = new
 
 
-def _reserve(st: State, r: dict, occ: dict[Cell, str]) -> str:
-    """Reserve cells ahead along the path. Returns the id of a blocking robot, if any."""
+def _reserve(st: State, r: dict, occ: dict[Cell, str], closed: set[Cell]) -> str:
+    """Reserve cells ahead along the path. Returns the id of a blocking robot, _CLOSED, or ""."""
     path, k = r["path"], r["k"]
     mine = {_t(c) for c in r["res"]}
     known = {_t(c) for c in st["known"]}
     for idx in range(k, min(len(path), k + wd.LOOKAHEAD_CELLS)):
         c = _t(path[idx])
+        if c in closed:
+            return _CLOSED
         if c in mine:
             continue
         owner = occ.get(c)
@@ -615,10 +641,17 @@ def _drive(st: State, r: dict, occ: dict[Cell, str], ev: list[Event]) -> None:
     while j + 1 < len(path) and path[j + 1][0] - path[j][0] == dx and path[j + 1][1] - path[j][1] == dy:
         j += 1
 
-    blocked_by = _reserve(st, r, occ)
+    closed = _closed_cells(st, r)
+    blocked_by = _reserve(st, r, occ, closed)
+    closed_ahead = blocked_by == _CLOSED
+    if closed_ahead:
+        blocked_by = ""
     mine = {_t(c) for c in r["res"]}
     fr = k - 1
     for idx in range(k, j + 1):
+        if _t(path[idx]) in closed:  # an aisle closed after we reserved into it: stop short
+            closed_ahead = True
+            break
         if _t(path[idx]) not in mine:
             break
         fr = idx
@@ -670,6 +703,9 @@ def _drive(st: State, r: dict, occ: dict[Cell, str], ev: list[Event]) -> None:
     if move > 0:
         r["blk"], r["wait"], r["wait_on"] = 0, 0, ""
         r["status"] = "moving"
+        return
+    if closed_ahead:  # waiting for a closed aisle to reopen is by design, not a stall
+        r["status"], r["held"] = "held", True
         return
     # A stall is being stuck, not queueing: behind a robot that is still moving, don't count.
     if not turning and not (blocked_by and st["robots"][blocked_by]["v"] > 0):
