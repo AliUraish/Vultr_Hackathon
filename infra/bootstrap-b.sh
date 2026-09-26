@@ -15,6 +15,11 @@ APT=(apt-get -q -o DPkg::Lock::Timeout=600)
 # Security updates stay on, but must not restart our services mid-demo (they restart on the next deploy).
 install -d /etc/needrestart/conf.d
 echo "\$nrconf{restart} = 'l';" > /etc/needrestart/conf.d/replay.conf
+
+# SSH: keys only. 10- sorts before cloud-init's 50- file, and sshd keeps the first value it reads.
+printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin prohibit-password\n' \
+  > /etc/ssh/sshd_config.d/10-replay-keys-only.conf
+sshd -t && systemctl reload ssh
 "${APT[@]}" install -y python3-venv python3-pip ufw rsync
 id replay >/dev/null 2>&1 || useradd --system --home-dir "$APP" --shell /usr/sbin/nologin replay
 install -d -m 750 -o root -g replay /etc/replay
