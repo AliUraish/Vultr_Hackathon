@@ -20,13 +20,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from replay_core.frames import ui_frame
-from replay_core.scenarios import SCENARIOS
+from replay_core.scenarios import SCENARIOS, reinject_hints
 from replay_core.world import TICK_HZ, W
 
 from . import auth, db, fleet, ingest, policies
 from .bus import Hub
 from .config import load
-from .orchestrator import Orchestrator, WorkflowError
+from .orchestrator import Orchestrator, WorkflowError, original_chaos
 from .runtime import Runtime
 from .simnode_client import SimNode, SimNodeError
 
@@ -114,6 +114,7 @@ class ResultBody(BaseModel):
     outcome: str | None = None
     failures: list[dict] | None = None
     new_failures: list[dict] | None = None
+    warnings: list[dict] | None = None
     trajectory_hash: str | None = None
     matches_live: bool | None = None
     first_divergence: int | None = None
@@ -163,10 +164,10 @@ async def replay_result(rid: int, body: ResultBody, rt: Runtime = Depends(get_rt
         r = await c.fetchrow(
             "UPDATE replays SET status = $2, outcome = $3, failures = $4, new_failures = $5, trajectory_hash = $6, "
             "matches_live = $7, first_divergence = $8, frames = $9, duration_ms = $10, error = $11, "
-            "finished_at = now() WHERE id = $1 AND status = 'running' "
+            "warnings = $12, finished_at = now() WHERE id = $1 AND status = 'running' "
             "RETURNING id, capsule_id, hypothesis_id, kind, worker",
             rid, body.status, body.outcome, body.failures, body.new_failures, body.trajectory_hash,
-            body.matches_live, body.first_divergence, body.frames, body.duration_ms, body.error)
+            body.matches_live, body.first_divergence, body.frames, body.duration_ms, body.error, body.warnings)
         if r is None:
             raise HTTPException(409, "replay is not running (requeued or already finished)")
         summary = {"replay": rid, "capsule": r["capsule_id"], "kind": r["kind"], "hypothesis": r["hypothesis_id"],
@@ -311,7 +312,7 @@ async def failure(fid: int, user: str = User, rt: Runtime = Depends(get_rt)) -> 
                 "blob->'policy' AS policy, blob->'baseline_failures' AS live_failures FROM capsules WHERE id = $1",
                 cid))
             out["replays"] = db.rows(await c.fetch(
-                "SELECT id, hypothesis_id, kind, policy_version, policy_rules, status, outcome, new_failures, "
+                "SELECT id, hypothesis_id, kind, policy_version, policy_rules, status, outcome, new_failures, warnings, "
                 "trajectory_hash, matches_live, first_divergence, worker, duration_ms, error, created_at, "
                 "finished_at FROM replays WHERE capsule_id = $1 AND kind IN ('reproduce', 'trial', 'proof') "
                 "ORDER BY id", cid))
@@ -357,11 +358,22 @@ async def dismiss(fid: int, user: str = User, rt: Runtime = Depends(get_rt)) -> 
 
 @app.post("/api/failures/{fid}/reinject")
 async def reinject(fid: int, user: str = User, rt: Runtime = Depends(get_rt)) -> dict:
+    """Recreate the original situation live: same aisle and gap, same item class, same aisle closed."""
     async with rt.pool.acquire() as c:
-        scenario = await c.fetchval("SELECT scenario FROM failures WHERE id = $1", fid)
-    if not scenario:
+        f = await c.fetchrow("SELECT f.run_id, f.type, f.tick, f.scenario, k.blob->'inputs' AS inputs "
+                             "FROM failures f LEFT JOIN capsules k ON k.failure_id = f.id WHERE f.id = $1", fid)
+        original = await original_chaos(c, f["run_id"], f["type"], f["tick"], f["inputs"]) if f else None
+    if f is None or not f["scenario"] or not original:
         raise HTTPException(409, "this failure was not caused by a canned scenario")
-    return await chaos(ChaosBody(scenario=scenario), user, rt)
+    hints = reinject_hints(original)
+    try:
+        res = await rt.sim.chaos(f["scenario"], hints, wait_ticks=900)
+    except SimNodeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    async with rt.pool.acquire() as c:
+        await db.log_event(c, "chaos.requested", {"scenario": f["scenario"], "by": user, "reinject_of": fid,
+                                                  **res}, run_id=rt.run_id, tick=rt.last_tick)
+    return res
 
 
 @app.post("/api/hypotheses/{hid}/approve")
