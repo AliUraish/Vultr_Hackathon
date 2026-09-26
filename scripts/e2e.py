@@ -50,6 +50,8 @@ def main() -> None:
     print(f"      run {st['run_id']}, tick {t_before}, policy v{policy_before}, {len(st['jobs'])} open jobs")
     wait("ticks advancing", lambda: http.get("/api/state").json()["tick"] > t_before + 20, 15)
 
+    http.post("/api/chaos", json={"scenario": "clear_floor"}).raise_for_status()  # start from a clean floor
+    time.sleep(1)
     known = {f["id"] for f in http.get("/api/failures").json()}
     r = http.post("/api/chaos", json={"scenario": scenario})
     r.raise_for_status()
@@ -59,7 +61,7 @@ def main() -> None:
     def new_failure():
         return next((f for f in http.get("/api/failures").json()
                      if f["id"] not in known and f["type"] == want), None)
-    f = wait(f"{want} detected by the rules", new_failure, 120)
+    f = wait(f"{want} detected by the rules", new_failure, 240 if scenario == "mislabel_bin" else 120)
     fid = f["id"]
     print(f"      failure #{fid}: {f['type']} {f['robot_id']} at tick {f['tick']}")
 
@@ -112,6 +114,29 @@ def main() -> None:
     print(f"  ok  capsule in regression suite ({len(suite)} total)")
     if proof["outcome"] != "avoided":
         raise SystemExit("FAIL  proof replay is not clean")
+
+    # Live proof: recreate the original situation (same aisle and gap / item class / aisle) under the fix.
+    last_event = http.get("/api/events", params={"limit": 1}).json()[0]["id"]
+    before = max(x["id"] for x in http.get("/api/failures").json())
+    r = http.post(f"/api/failures/{fid}/reinject", json={})
+    r.raise_for_status()
+    print(f"  ok  re-injected live with hints {r.json().get('hints')}")
+
+    def fired():
+        evs = http.get("/api/events", params={"limit": 50}).json()
+        new = [e for e in evs if e["id"] > last_event]
+        if any(e["type"] == "sim.chaos_expired" for e in new):
+            raise SystemExit("FAIL  re-inject expired: no robot got into the original position")
+        return next((e for e in new if e["type"] == "input.chaos" and e["payload"].get("scenario") == scenario), None)
+    e = wait("original situation recreated on the live floor", fired, 100)
+    print(f"      t{e['tick']}: {e['payload'].get('type')} {e['payload'].get('cell') or e['payload'].get('slot') or e['payload'].get('zone')}"
+          f" target {e['payload'].get('target')} gap {e['payload'].get('gap_mm', '-')} mm")
+    time.sleep(40 if scenario == "mislabel_bin" else 20)  # a mislabeled pick only shows at the dock
+    again = [x for x in http.get("/api/failures").json() if x["id"] > before and x["type"] == want]
+    if again:
+        raise SystemExit(f"FAIL  {want} happened again under v{new_version}: {again[0]['robot_id']} t{again[0]['tick']}")
+    print(f"  ok  no {want} under v{new_version}: the fix holds live")
+    http.post("/api/chaos", json={"scenario": "clear_floor"}).raise_for_status()  # leave it tidy
     print("END TO END: PASS")
 
 
