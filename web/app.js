@@ -18,7 +18,7 @@ async function api(path, opts = {}) {
   const init = { credentials: "same-origin", method: opts.method || (opts.body ? "POST" : "GET"), headers: {} };
   if (opts.body !== undefined) { init.headers["Content-Type"] = "application/json"; init.body = JSON.stringify(opts.body); }
   const res = await fetch(path, init);
-  if (res.status === 401) { showLogin(); throw new Error("sign in required"); }
+  if (res.status === 401 && path !== "/api/login") { showLogin(); throw new Error("sign in required"); }
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`;
     try { const j = await res.json(); msg = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail); } catch { /* keep status text */ }
@@ -356,7 +356,10 @@ function renderHypotheses(data) {
     const g = h.gate || {}, reg = g.regression;
     const gate = h.status === "regression" ? `regression suite: ${h.regression_done}/${(g.suite || []).length} checked…`
       : reg ? `regression suite: ${reg.passed}/${reg.total} clean${reg.total ? ` under v${g.policy_version}` : " (suite empty)"}` : "";
-    const newF = trial && trial.new_failures && trial.new_failures.length ? `new failures: ${trial.new_failures.map((x) => `${x.type} ${x.robot}`).join(", ")}` : "";
+    const newF = [
+      trial && trial.new_failures && trial.new_failures.length ? `new failures: ${trial.new_failures.map((x) => `${x.type} ${x.robot}`).join(", ")}` : "",
+      trial && trial.warnings && trial.warnings.length ? `warning, in the 40 s after the recording: ${trial.warnings.map((x) => `${x.type} ${x.robot}`).join(", ")}` : "",
+    ].filter(Boolean).join(" · ");
     return `<div class="hyp ${h.status}">
       <div class="row between"><b>#${h.rank}</b>${statusPill2(h.status)}</div>
       <div class="fix">${esc(h.fix_dsl)}</div>

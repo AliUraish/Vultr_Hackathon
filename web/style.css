@@ -123,7 +123,19 @@ table.grid tbody tr.link:hover { background: var(--panel-2); }
 .chip.replay { cursor: pointer; }
 .chip.replay.sel { border-color: var(--accent); }
 .scrubber { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
-.track-wrap { position: relative; flex: 1; }
+.track-wrap { position: relative; flex: 1; min-width: 0; }
+#scrub-label { white-space: nowrap; }
+@media (max-width: 600px) {
+  .row.between { flex-wrap: wrap; }
+  .chips { min-width: 0; }
+  .chip.replay { white-space: normal; }
+  .scrubber { flex-wrap: wrap; }
+  .track-wrap { flex-basis: 100%; order: -1; }
+  .chain li { grid-template-columns: 56px 1fr; }
+  .chain li span:last-child { grid-column: 1 / -1; }
+  .log li { grid-template-columns: 56px 1fr; }
+  .log li .p { grid-column: 1 / -1; }
+}
 .track-wrap input { width: 100%; padding: 0; }
 input[type=range] { accent-color: var(--accent); background: transparent; border: none; }
 .marks { position: absolute; left: 0; right: 0; top: -6px; height: 6px; pointer-events: none; }
