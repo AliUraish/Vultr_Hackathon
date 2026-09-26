@@ -22,7 +22,7 @@ from pydantic import BaseModel
 
 from replay_core.live import LiveSim
 from replay_core.policy import PolicyError, make_policy
-from replay_core.scenarios import SCENARIOS
+from replay_core.scenarios import SCENARIOS, check_hints
 from replay_core.state import state_hash
 from replay_core.world import MAP_HASH, TICK_HZ, W
 
@@ -74,9 +74,10 @@ class Node:
             self.snapshots.append({"tick": rec.snapshot["tick"], "hash": state_hash(rec.snapshot),
                                    "state": rec.snapshot})
         for req in self.sim.expired:
+            where = f" ({', '.join(f'{k}={v}' for k, v in req.hints.items())})" if req.hints else ""
             self.notices.append({"type": "chaos_expired", "tick": rec.tick, "request": req.id,
-                                 "scenario": req.scenario,
-                                 "message": f"no robot was in position for {req.scenario}"})
+                                 "scenario": req.scenario, "hints": req.hints,
+                                 "message": f"{req.scenario}: no robot got into position{where}"})
         self.sim.expired.clear()
         while len(self.outbox) > MAX_BUFFER_TICKS:
             self.outbox.popleft()
@@ -175,6 +176,7 @@ class Commands(BaseModel):
 class Chaos(BaseModel):
     scenario: str
     wait_ticks: int = 300
+    hints: dict = {}
 
 
 class Policy(BaseModel):
@@ -221,9 +223,13 @@ async def cancel(rid: str, node: Node = Depends(get_node)) -> dict:
 async def chaos(body: Chaos, node: Node = Depends(get_node)) -> dict:
     if body.scenario not in SCENARIOS:
         raise HTTPException(400, f"unknown scenario; known: {', '.join(SCENARIOS)}")
+    try:
+        hints = check_hints(body.hints)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     assert node.sim is not None
-    return {"request_id": node.sim.request_chaos(body.scenario, max(1, min(body.wait_ticks, 1200))),
-            "tick": node.sim.tick_no}
+    return {"request_id": node.sim.request_chaos(body.scenario, max(1, min(body.wait_ticks, 1200)), hints),
+            "tick": node.sim.tick_no, "hints": hints}
 
 
 @app.post("/fleet/policy", dependencies=Auth)
