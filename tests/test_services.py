@@ -221,3 +221,85 @@ def test_inference_config_from_env(monkeypatch):
         "openai", "sk", "https://api.openai.com/v1", "")
     assert _inference({"VULTR_INFERENCE_KEY": "vk"})[:3] == ("vultr", "vk", "https://api.vultrinference.com/v1")
     assert _inference({})[1] == ""  # no key: playbook only
+
+
+def test_reinject_recreates_the_original_situation():
+    from replay_core.scenarios import check_hints, reinject_hints, resolve
+    from replay_core.world import W
+
+    # A pallet that fell 0.3 m ahead of a robot in aisle_5E is recreated in aisle_5E, at that gap,
+    # ahead of any moving robot (after a speed cap no robot is "fast").
+    assert reinject_hints({"type": "spawn_pallet", "cell": [15, 5], "gap_mm": 300}) == {
+        "min_v": 1, "zone": "aisle_5E", "fallback_zone": "racks", "fallback_after": 300, "gap_mm": 300}
+    assert reinject_hints({"type": "mislabel", "slot": "C4"}) == {"cls": W.slots["C4"]["cls"]}
+    assert reinject_hints({"type": "restrict_zone", "zone": "aisle_3W"}) == {"zone": "aisle_3W", "now": True}
+    for bad in ({"zone": "moon"}, {"gap_mm": 5}, {"cls": "gold"}, {"evil": 1}):
+        with pytest.raises(ValueError):
+            check_hints(bad)
+
+    d = Driver(seed=1, job_seed=1, rules=["speed_cap(racks, 0.5)"])  # nobody is fast any more
+    d.run(300)
+    got = None
+    for _ in range(600):
+        got = resolve(d.sim.state, "pallet_drop", {"min_v": 1, "zone": "racks", "gap_mm": 300})
+        if got:
+            break
+        d.run(1)
+    assert got and 270 <= got[0]["gap_mm"] <= 330 and got[0]["v"] <= 50
+    closed = resolve(d.sim.state, "worker_in_aisle", {"zone": "aisle_3W", "now": True})
+    assert closed[0]["zone"] == "aisle_3W"
+
+
+def test_reinjected_pallet_is_survived_under_the_fix():
+    """The demo's proof: same aisle, same gap, fixed policy -> the robot brakes in time."""
+    d = Driver(seed=1, job_seed=1, rules=["speed_cap(racks, 0.5)"])
+    d.run(300)
+    d.sim.request_chaos("pallet_drop", 900, {"min_v": 1, "zone": "racks", "gap_mm": 300})
+    d.run(900)
+    assert not d.sim._chaos, "re-inject never found a robot in position"
+    assert not [f for f in d.failures if f["type"] == "collision"]
+
+
+def test_trials_start_from_the_policy_live_at_the_failure():
+    from replay_core.capsule import policy_at
+    cap = {"snapshot": {"policy": {"rules": ["speed_cap(racks, 0.6)"]}},
+           "inputs": [[100, [{"kind": "policy", "version": 5,
+                              "rules": ["speed_cap(racks, 0.6)", "require_scan_confirm(loose_small)"]}]],
+                      [900, [{"kind": "policy", "version": 6, "rules": ["x"]}]]]}
+    assert policy_at(cap, 50) == ["speed_cap(racks, 0.6)"]
+    assert policy_at(cap, 500) == ["speed_cap(racks, 0.6)", "require_scan_confirm(loose_small)"]
+
+
+def test_reinject_falls_back_from_a_quiet_aisle():
+    from replay_core.live import ChaosRequest
+    req = ChaosRequest("c1", "pallet_drop", 900, {"zone": "aisle_7E", "fallback_zone": "racks",
+                                                  "fallback_after": 300, "gap_mm": 300}, created=1000)
+    assert req.effective_hints(1100)["zone"] == "aisle_7E"
+    assert req.effective_hints(1300) == {"zone": "racks", "gap_mm": 300}
+
+
+def test_respect_closures_holds_robots_outside_a_closed_aisle():
+    """With the rule, a closed aisle is never entered, and waiting outside it is not a stall."""
+    from replay_core.world import STALL_TICKS
+    for rules, expect_breach in (([], True), (["respect_closures(racks)"], False)):
+        d = Driver(seed=1, job_seed=1, rules=rules)
+        d.run(300)
+        d.sim.request_chaos("worker_in_aisle", 600)
+        d.run(900)
+        breaches = [f for f in d.failures if f["type"] == "zone_breach"]
+        assert bool(breaches) == expect_breach, rules
+        if not expect_breach:
+            assert not [f for f in d.failures if f["type"] == "stall"]
+            held = [r for rec in d.records for r in rec["frame"]["robots"] if r["st"] == "held"]
+            assert all(r["blk"] < STALL_TICKS for r in held)
+
+
+def test_late_traffic_stalls_warn_but_safety_failures_block():
+    from replay_core.capsule import classify
+    target = {"type": "collision", "robot": "R2"}
+    control = [{"type": "collision", "robot": "R2", "tick": 148}]
+    late_stall = {"type": "stall", "robot": "R1", "tick": 509}
+    assert classify([late_stall], control, target, 168) == ("avoided", [], [late_stall])
+    assert classify([{"type": "stall", "robot": "R1", "tick": 150}], control, target, 168)[0] == "regressed"
+    assert classify([{"type": "zone_breach", "robot": "R3", "tick": 509}], control, target, 168)[0] == "regressed"
+    assert classify([{"type": "collision", "robot": "R2", "tick": 400}], control, target, 168)[0] == "reproduced"
