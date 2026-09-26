@@ -34,7 +34,7 @@ def run_job(job: dict, blob: dict) -> dict:
                 "duration_ms": int((time.perf_counter() - t0) * 1000)}
     return {
         "status": "done", "outcome": res["outcome"], "failures": res["failures"],
-        "new_failures": res["new_failures"], "trajectory_hash": res["trajectory_hash"],
+        "new_failures": res["new_failures"], "warnings": res["warnings"], "trajectory_hash": res["trajectory_hash"],
         "matches_live": res["matches_live"], "first_divergence": res["first_divergence"],
         "frames": [ui_frame(f, with_paths=False) for f in res["frames"]] if keep else None,
         "duration_ms": int((time.perf_counter() - t0) * 1000),
