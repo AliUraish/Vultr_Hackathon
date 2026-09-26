@@ -27,8 +27,9 @@ class SimNode:
     async def cancel(self, robot: str) -> dict:
         return await self._post(f"/fleet/robots/{robot}/cancel", {})
 
-    async def chaos(self, scenario: str) -> dict:
-        return await self._post("/fleet/chaos", {"scenario": scenario})
+    async def chaos(self, scenario: str, hints: dict | None = None, wait_ticks: int = 300) -> dict:
+        return await self._post("/fleet/chaos", {"scenario": scenario, "hints": hints or {},
+                                                 "wait_ticks": wait_ticks})
 
     async def policy(self, version: int, rules: list[str]) -> dict:
         return await self._post("/fleet/policy", {"version": version, "rules": rules})
