@@ -1,4 +1,4 @@
-"""The three canned failures: each reproduces 3/3, the right fix avoids it, a wrong one doesn't."""
+"""The three injected hazards: each reproduces 3/3, the right fix avoids it, a wrong one doesn't."""
 from dataclasses import dataclass
 
 import pytest
@@ -17,28 +17,28 @@ class Case:
 
 
 CASES = [
-    Case("pallet_drop", "collision", 1, ["min_clearance(0.4)"]),
-    Case("mislabel_bin", "wrong_item", 2, ["speed_cap(racks, 0.5)"]),
-    Case("worker_in_aisle", "zone_breach", 1, ["speed_cap(racks, 0.5)"]),
+    Case("rockfall", "collision", 1, ["min_clearance(6)"]),
+    Case("grade_mixup", "wrong_item", 2, ["min_clearance(6)"]),
+    Case("blast_closure", "zone_breach", 1, ["speed_cap(benches, 20)"]),
 ]
 
 
 def right_fix(case: Case, failure: dict, d: Driver) -> list[str]:
-    if case.scenario == "pallet_drop":
-        return ["speed_cap(racks, 0.5)"]
-    if case.scenario == "worker_in_aisle":
-        return ["respect_closures(racks)"]
-    slot = next(e["slot"] for e in d.events if e["type"] == "bin_mislabeled")
-    return [f"require_scan_confirm({W.slots[slot]['cls']})"]
+    if case.scenario == "rockfall":
+        return ["speed_cap(benches, 20)"]
+    if case.scenario == "blast_closure":
+        return ["respect_closures(benches)"]
+    slot = next(e["slot"] for e in d.events if e["type"] == "grade_mislabeled")
+    return [f"grade_check({W.slots[slot]['cls']})"]
 
 
 @pytest.fixture(scope="module", params=CASES, ids=[c.scenario for c in CASES])
 def run(request):
     case: Case = request.param
     d = Driver(seed=case.seed, job_seed=case.seed)
-    d.run(300)
-    d.sim.request_chaos(case.scenario, wait_ticks=600)
-    found = d.run(2500, stop=lambda fs: any(f["type"] == case.failure for f in fs))
+    d.run(400)
+    d.sim.request_chaos(case.scenario, wait_ticks=1200)
+    found = d.run(3500, stop=lambda fs: any(f["type"] == case.failure for f in fs))
     failure = next((f for f in found if f["type"] == case.failure), None)
     assert failure is not None, f"{case.scenario} never produced a {case.failure}"
     cap = d.cut(failure)

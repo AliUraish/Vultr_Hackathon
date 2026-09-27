@@ -28,9 +28,9 @@ def cases():
     out = []
     for case in CASES:
         d = Driver(seed=case.seed, job_seed=case.seed)
-        d.run(300)
-        d.sim.request_chaos(case.scenario, wait_ticks=600)
-        found = d.run(2500, stop=lambda fs, c=case: any(f["type"] == c.failure for f in fs))
+        d.run(400)
+        d.sim.request_chaos(case.scenario, wait_ticks=1200)
+        found = d.run(3500, stop=lambda fs, c=case: any(f["type"] == c.failure for f in fs))
         failure = next(f for f in found if f["type"] == case.failure)
         out.append((case, failure, d.cut(failure), d))
     return out
@@ -55,11 +55,11 @@ def test_playbook_never_proposes_a_deployed_rule(cases):
 def test_validate_keeps_only_dsl_rules():
     hyps, errors = diagnosis.validate({"hypotheses": [
         {"cause": "x", "fix": "__import__('os').system('rm -rf /')"},
-        {"cause": "y", "fix": "speed_cap( racks , 0.50 )"},
-        {"cause": "z", "fix": "speed_cap(racks, 0.5)"},     # duplicate after normalizing
-        {"cause": 3, "fix": "min_clearance(0.4)"},
+        {"cause": "y", "fix": "speed_cap( benches , 20.0 )"},
+        {"cause": "z", "fix": "speed_cap(benches, 20)"},     # duplicate after normalizing
+        {"cause": 3, "fix": "min_clearance(6)"},
     ]}, [])
-    assert [h["fix"] for h in hyps] == ["speed_cap(racks, 0.5)"]
+    assert [h["fix"] for h in hyps] == ["speed_cap(benches, 20)"]
     assert len(errors) == 3
 
 
@@ -71,7 +71,7 @@ def test_inference_retries_once_with_the_validation_errors(cases):
     case, failure, cap, _ = cases[0]
     ctx = diagnosis.context(cap, {"detail": failure["detail"]}, [], [])
     answers = ["I think it was going too fast.",
-               json.dumps({"hypotheses": [{"cause": "too fast in the aisle", "fix": "speed_cap(racks, 0.5)",
+               json.dumps({"hypotheses": [{"cause": "too fast on the bench", "fix": "speed_cap(benches, 20)",
                                            "rationale": "stopping distance"}]})]
     sent: list[dict] = []
 
@@ -84,8 +84,8 @@ def test_inference_retries_once_with_the_validation_errors(cases):
 
     hyps, source, notes = asyncio.run(diagnosis.diagnose(settings("k"), ctx, httpx.MockTransport(handler)))
     assert source == "vultr:llama-3.3-70b-instruct"
-    assert "response_format" not in sent[0]  # not every OpenAI-compatible server supports JSON mode
-    assert [h["fix"] for h in hyps] == ["speed_cap(racks, 0.5)"]
+    assert sent[0]["response_format"] == {"type": "json_object"}   # Vultr Serverless Inference JSON mode
+    assert [h["fix"] for h in hyps] == ["speed_cap(benches, 20)"]
     assert len(sent) == 2 and "problems" in sent[1]["messages"][-1]["content"]
     assert notes
 
@@ -104,7 +104,7 @@ def test_worker_reproduces_and_trials(cases):
            "control_rules": None}
     rep = run_job(job, cap)
     assert rep["status"] == "done" and rep["outcome"] == "reproduced" and rep["matches_live"]
-    assert rep["frames"] and set(rep["frames"][0]) == {"t", "robots", "pallets", "zones", "ev"}
+    assert rep["frames"] and set(rep["frames"][0]) == {"t", "robots", "rocks", "holes", "zones", "ev"}
     trial = run_job({**job, "kind": "trial", "policy_rules": right_fix(case, failure, d),
                      "control_failures": rep["failures"]}, cap)
     assert trial["outcome"] == "avoided"
@@ -128,7 +128,7 @@ def test_sim_node_streams_contiguous_ticks_and_snapshots():
         body = json.loads(req.content)
         if req.url.path == "/api/node/hello":
             assert body["map"] == MAP_HASH
-            return httpx.Response(200, json={"policy": {"version": 3, "rules": ["speed_cap(racks, 0.5)"]}})
+            return httpx.Response(200, json={"policy": {"version": 3, "rules": ["speed_cap(benches, 20)"]}})
         if fail_next["n"]:
             fail_next["n"] -= 1
             return httpx.Response(500)
@@ -152,7 +152,7 @@ def test_sim_node_streams_contiguous_ticks_and_snapshots():
     assert [s["tick"] for s in snaps] == [0, 50, 100]
     assert all(s["hash"] == state_hash(s["state"]) for s in snaps)
     assert all(b["policy_version"] == 3 for b in posted)
-    assert node.sim.state["policy"]["rules"] == ["speed_cap(racks, 0.5)"]
+    assert node.sim.state["policy"]["rules"] == ["speed_cap(benches, 20)"]
 
 
 def test_fleet_api_rejects_bad_steps():
@@ -161,7 +161,7 @@ def test_fleet_api_rejects_bad_steps():
                 [{"op": "drop", "dock": "DK9"}]):
         with pytest.raises(HTTPException):
             _check_steps(bad)
-    _check_steps([{"op": "goto", "cell": [3, 3]}, {"op": "pick", "slot": "A2"}, {"op": "drop", "dock": "DK1"}])
+    _check_steps([{"op": "goto", "cell": [3, 3]}, {"op": "pick", "slot": "A"}, {"op": "drop", "dock": "DK1"}])
 
 
 def test_capsule_survives_json_round_trip(cases):
@@ -169,9 +169,9 @@ def test_capsule_survives_json_round_trip(cases):
     assert capsule.run(cap, keep_frames=False)["matches_live"]
 
 
-def _openai_capture(models: list[str]):
+def _vultr_capture(models: list[str]):
     sent: list[dict] = []
-    answer = json.dumps({"hypotheses": [{"cause": "too fast", "fix": "speed_cap(racks, 0.5)"}]})
+    answer = json.dumps({"hypotheses": [{"cause": "too fast", "fix": "speed_cap(benches, 20)"}]})
 
     def handler(req: httpx.Request) -> httpx.Response:
         if req.url.path.endswith("/models"):
@@ -182,15 +182,13 @@ def _openai_capture(models: list[str]):
     return sent, httpx.MockTransport(handler)
 
 
-def test_openai_picks_a_small_chat_model_and_uses_json_mode(cases):
+def test_picks_a_chat_model_and_uses_json_mode(cases):
     case, failure, cap, _ = cases[0]
     ctx = diagnosis.context(cap, {"detail": failure["detail"]}, [], [])
-    sent, transport = _openai_capture(["gpt-3.5-turbo-instruct", "text-embedding-3-small", "gpt-4o",
-                                       "gpt-4.1-mini", "whisper-1"])
-    hyps, source, _ = asyncio.run(diagnosis.diagnose(settings("k", "openai"), ctx, transport))
-    assert source == "openai:gpt-4.1-mini" and hyps
-    assert sent[0]["response_format"] == {"type": "json_object"}
-    assert "max_tokens" not in sent[0] and "temperature" not in sent[0] and sent[0]["max_completion_tokens"]
+    sent, transport = _vultr_capture(["bge-embed-large", "whisper-v3", "deepseek-v4-flash-0731", "llama-3.3-70b"])
+    hyps, source, _ = asyncio.run(diagnosis.diagnose(settings("k", "vultr"), ctx, transport))
+    assert source.startswith("vultr:") and "embed" not in source and "whisper" not in source and hyps
+    assert sent[0]["response_format"] == {"type": "json_object"} and sent[0]["max_tokens"] == 900
 
 
 def test_rejected_parameters_are_adapted_and_resent(cases):
@@ -198,7 +196,7 @@ def test_rejected_parameters_are_adapted_and_resent(cases):
     case, failure, cap, _ = cases[0]
     ctx = diagnosis.context(cap, {"detail": failure["detail"]}, [], [])
     sent: list[dict] = []
-    answer = json.dumps({"hypotheses": [{"cause": "too fast", "fix": "speed_cap(racks, 0.5)"}]})
+    answer = json.dumps({"hypotheses": [{"cause": "too fast", "fix": "speed_cap(benches, 20)"}]})
 
     def handler(req: httpx.Request) -> httpx.Response:
         body = json.loads(req.content)
@@ -217,8 +215,10 @@ def test_rejected_parameters_are_adapted_and_resent(cases):
 
 def test_inference_config_from_env(monkeypatch):
     from control.config import _inference
-    assert _inference({"INFERENCE_KEY": "sk", "INFERENCE_PROVIDER": "openai"}) == (
-        "openai", "sk", "https://api.openai.com/v1", "")
+    with pytest.raises(RuntimeError, match="only Vultr"):
+        _inference({"INFERENCE_KEY": "sk", "INFERENCE_PROVIDER": "openai"})
+    assert _inference({"INFERENCE_KEY": "vk", "INFERENCE_MODEL": "m"}) == (
+        "vultr", "vk", "https://api.vultrinference.com/v1", "m")
     assert _inference({"VULTR_INFERENCE_KEY": "vk"})[:3] == ("vultr", "vk", "https://api.vultrinference.com/v1")
     assert _inference({})[1] == ""  # no key: playbook only
 
@@ -227,65 +227,65 @@ def test_reinject_recreates_the_original_situation():
     from replay_core.scenarios import check_hints, reinject_hints, resolve
     from replay_core.world import W
 
-    # A pallet that fell 0.3 m ahead of a robot in aisle_5E is recreated in aisle_5E, at that gap,
-    # ahead of any moving robot (after a speed cap no robot is "fast").
-    assert reinject_hints({"type": "spawn_pallet", "cell": [15, 5], "gap_mm": 300}) == {
-        "min_v": 1, "zone": "aisle_5E", "fallback_zone": "racks", "fallback_after": 300, "gap_mm": 300}
-    assert reinject_hints({"type": "mislabel", "slot": "C4"}) == {"cls": W.slots["C4"]["cls"]}
-    assert reinject_hints({"type": "restrict_zone", "zone": "aisle_3W"}) == {"zone": "aisle_3W", "now": True}
+    # A rock that fell 12 m ahead of a truck on the upper west bench is recreated on that bench, at that gap,
+    # ahead of any moving truck (after a speed cap no truck is "fast").
+    assert reinject_hints({"type": "spawn_rock", "cell": [12, 7], "gap_mm": 12000}) == {
+        "min_v": 1, "zone": "bench_upper_w", "fallback_zone": "benches", "fallback_after": 450, "gap_mm": 12000}
+    assert reinject_hints({"type": "mislabel", "slot": "A"}) == {"cls": W.slots["A"]["cls"]}
+    assert reinject_hints({"type": "restrict_zone", "zone": "bench_lower_w"}) == {"zone": "bench_lower_w", "now": True}
     for bad in ({"zone": "moon"}, {"gap_mm": 5}, {"cls": "gold"}, {"evil": 1}):
         with pytest.raises(ValueError):
             check_hints(bad)
 
-    d = Driver(seed=1, job_seed=1, rules=["speed_cap(racks, 0.5)"])  # nobody is fast any more
+    d = Driver(seed=1, job_seed=1, rules=["speed_cap(benches, 20)"])  # nobody is fast on the benches any more
     d.run(300)
     got = None
-    for _ in range(600):
-        got = resolve(d.sim.state, "pallet_drop", {"min_v": 1, "zone": "racks", "gap_mm": 300})
+    for _ in range(1500):
+        got = resolve(d.sim.state, "rockfall", {"min_v": 1, "zone": "benches", "gap_mm": 12000})
         if got:
             break
         d.run(1)
-    assert got and 270 <= got[0]["gap_mm"] <= 330 and got[0]["v"] <= 50
-    closed = resolve(d.sim.state, "worker_in_aisle", {"zone": "aisle_3W", "now": True})
-    assert closed[0]["zone"] == "aisle_3W"
+    assert got and 10500 <= got[0]["gap_mm"] <= 13500 and got[0]["v"] <= 555
+    closed = resolve(d.sim.state, "blast_closure", {"zone": "bench_upper_w", "now": True})
+    assert closed[0]["zone"] == "bench_upper_w"
 
 
-def test_reinjected_pallet_is_survived_under_the_fix():
-    """The demo's proof: same aisle, same gap, fixed policy -> the robot brakes in time."""
-    d = Driver(seed=1, job_seed=1, rules=["speed_cap(racks, 0.5)"])
+def test_reinjected_rock_is_survived_under_the_fix():
+    """The demo's proof: same bench, same gap, fixed policy -> the truck brakes in time."""
+    d = Driver(seed=1, job_seed=1, rules=["speed_cap(benches, 20)"])
     d.run(300)
-    d.sim.request_chaos("pallet_drop", 900, {"min_v": 1, "zone": "racks", "gap_mm": 300})
-    d.run(900)
-    assert not d.sim._chaos, "re-inject never found a robot in position"
+    d.sim.request_chaos("rockfall", 1500, {"min_v": 1, "zone": "benches", "gap_mm": 14000})
+    d.run(1500)
+    assert not d.sim._chaos, "re-inject never found a truck in position"
     assert not [f for f in d.failures if f["type"] == "collision"]
 
 
 def test_trials_start_from_the_policy_live_at_the_failure():
     from replay_core.capsule import policy_at
-    cap = {"snapshot": {"policy": {"rules": ["speed_cap(racks, 0.6)"]}},
+    cap = {"snapshot": {"policy": {"rules": ["speed_cap(benches, 20)"]}},
            "inputs": [[100, [{"kind": "policy", "version": 5,
-                              "rules": ["speed_cap(racks, 0.6)", "require_scan_confirm(loose_small)"]}]],
+                              "rules": ["speed_cap(benches, 20)", "grade_check(ore)"]}]],
                       [900, [{"kind": "policy", "version": 6, "rules": ["x"]}]]]}
-    assert policy_at(cap, 50) == ["speed_cap(racks, 0.6)"]
-    assert policy_at(cap, 500) == ["speed_cap(racks, 0.6)", "require_scan_confirm(loose_small)"]
+    assert policy_at(cap, 50) == ["speed_cap(benches, 20)"]
+    assert policy_at(cap, 500) == ["speed_cap(benches, 20)", "grade_check(ore)"]
 
 
-def test_reinject_falls_back_from_a_quiet_aisle():
+def test_reinject_falls_back_from_a_quiet_bench():
     from replay_core.live import ChaosRequest
-    req = ChaosRequest("c1", "pallet_drop", 900, {"zone": "aisle_7E", "fallback_zone": "racks",
-                                                  "fallback_after": 300, "gap_mm": 300}, created=1000)
-    assert req.effective_hints(1100)["zone"] == "aisle_7E"
-    assert req.effective_hints(1300) == {"zone": "racks", "gap_mm": 300}
+    req = ChaosRequest("c1", "rockfall", 900, {"zone": "bench_lower_e", "fallback_zone": "benches",
+                                               "fallback_after": 450, "gap_mm": 12000}, created=1000)
+    assert req.effective_hints(1100)["zone"] == "bench_lower_e"
+    assert req.effective_hints(1500) == {"zone": "benches", "gap_mm": 12000}
 
 
-def test_respect_closures_holds_robots_outside_a_closed_aisle():
-    """With the rule, a closed aisle is never entered, and waiting outside it is not a stall."""
+def test_respect_closures_holds_trucks_outside_a_closed_bench():
+    """With the rule, a road closed for blasting is never entered, and waiting outside it is not a stall."""
     from replay_core.world import STALL_TICKS
-    for rules, expect_breach in (([], True), (["respect_closures(racks)"], False)):
+    for rules, expect_breach in (([], True), (["respect_closures(benches)"], False)):
         d = Driver(seed=1, job_seed=1, rules=rules)
-        d.run(300)
-        d.sim.request_chaos("worker_in_aisle", 600)
-        d.run(900)
+        d.run(400)
+        d.sim.request_chaos("blast_closure", 1200)
+        d.run(1500)
         breaches = [f for f in d.failures if f["type"] == "zone_breach"]
         assert bool(breaches) == expect_breach, rules
         if not expect_breach:
@@ -296,10 +296,10 @@ def test_respect_closures_holds_robots_outside_a_closed_aisle():
 
 def test_late_traffic_stalls_warn_but_safety_failures_block():
     from replay_core.capsule import classify
-    target = {"type": "collision", "robot": "R2"}
-    control = [{"type": "collision", "robot": "R2", "tick": 148}]
-    late_stall = {"type": "stall", "robot": "R1", "tick": 509}
+    target = {"type": "collision", "robot": "T02"}
+    control = [{"type": "collision", "robot": "T02", "tick": 148}]
+    late_stall = {"type": "stall", "robot": "T01", "tick": 509}
     assert classify([late_stall], control, target, 168) == ("avoided", [], [late_stall])
-    assert classify([{"type": "stall", "robot": "R1", "tick": 150}], control, target, 168)[0] == "regressed"
-    assert classify([{"type": "zone_breach", "robot": "R3", "tick": 509}], control, target, 168)[0] == "regressed"
-    assert classify([{"type": "collision", "robot": "R2", "tick": 400}], control, target, 168)[0] == "reproduced"
+    assert classify([{"type": "stall", "robot": "T01", "tick": 150}], control, target, 168)[0] == "regressed"
+    assert classify([{"type": "zone_breach", "robot": "T03", "tick": 509}], control, target, 168)[0] == "regressed"
+    assert classify([{"type": "collision", "robot": "T02", "tick": 400}], control, target, 168)[0] == "reproduced"

@@ -4,27 +4,29 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#000000">
-  <title>Replay · Fleet Incident Lab</title>
+  <meta name="description" content="Live control of an autonomous open-pit haul fleet: AI dispatch, right of way, fault recovery and exact incident replay on Vultr.">
+  <title>Replay · Pit Control</title>
   <link rel="stylesheet" href="/static/style.css">
   <script type="importmap">{"imports": {"three": "/static/vendor/three/three.module.min.js", "three/addons/": "/static/vendor/three/addons/"}}</script>
 </head>
 <body>
   <header class="topbar">
-    <div class="brand" id="brand"><span class="logo">⟲</span> Replay <span class="sub" id="site-chip">fleet incident lab</span></div>
+    <div class="brand" id="brand"><span class="logo">⛏</span> Replay <span class="sub" id="site-chip">autonomous haul control</span></div>
     <nav id="nav">
-      <a href="#/live" data-view="live">Live</a>
-      <a href="#/floor" data-view="floor">Map</a>
-      <a href="#/incidents" data-view="incidents">Incidents<span id="inbox-badge" class="badge" hidden></span></a>
-      <a href="#/regression" data-view="regression">Regression</a>
-      <a href="#/log" data-view="log">Event log</a>
-      <a href="#/policy" data-view="policy">Policy</a>
-      <a href="#/platform" data-view="platform">Platform</a>
+      <a href="#/live" data-view="live" title="The live open pit in 3D: every haul truck, excavator and AI decision as it happens">Live pit<small>trucks · diggers · AI decisions</small></a>
+      <a href="#/floor" data-view="floor" title="Top-down haul road map with the dig faces, load tickets and production numbers">Haul map<small>loads · faces · production</small></a>
+      <a href="#/incidents" data-view="incidents" title="Every failure the safety rules catch: recorded exactly, replayed, investigated by the AI and fixed">Incidents<span id="inbox-badge" class="badge" hidden></span><small>replay · investigate · fix</small></a>
+      <a href="#/regression" data-view="regression" title="Each approved fix leaves its incident behind as a test that every later fix must pass">Proven fixes<small>regression tests</small></a>
+      <a href="#/log" data-view="log" title="Every event on the mine, sealed into a tamper-evident chain and witnessed by the second VM">Audit log<small>sealed · verifiable</small></a>
+      <a href="#/policy" data-view="policy" title="The signed rule versions the haul fleet runs, and the incident behind each rule">Haul rules<small>signed versions</small></a>
     </nav>
     <div class="status">
-      <span id="policy-chip" class="chip mono">policy –</span>
+      <span id="spend-chip" class="chip spend" title="Vultr Serverless Inference calls made by the AI agents running the pit">⚡ <b id="spend-calls">0</b><small><span id="spend-cpm">0</span> calls/min</small></span>
+      <span id="ai-chip" class="chip ai" title="The model on Vultr Serverless Inference that dispatches trucks, rules on right of way and runs investigations">✦ <span id="ai-text">AI</span></span>
+      <span id="policy-chip" class="chip mono">rules –</span>
       <span id="sim-chip" class="chip"><span class="dot"></span><span id="sim-text">sim offline</span></span>
       <span class="chip mono">t <span id="tick-num" data-v="0">–</span></span>
-      <button id="logout" style="height:28px;padding:0 11px;font-size:12px">Sign out</button>
+      <button id="logout" hidden style="height:28px;padding:0 11px;font-size:12px">Sign out</button>
     </div>
   </header>
 
@@ -36,15 +38,14 @@
     <section id="view-regression" hidden></section>
     <section id="view-log" hidden></section>
     <section id="view-policy" hidden></section>
-    <section id="view-platform" hidden></section>
   </main>
 
   <aside id="inspector" class="drawer"></aside>
 
   <div id="login" class="overlay" hidden>
     <form id="login-form" class="panel login glow">
-      <div class="brand"><span class="logo">⟲</span> Replay</div>
-      <div class="hint">Fleet incident lab · sign in</div>
+      <div class="brand"><span class="logo">⛏</span> Replay</div>
+      <div class="hint">Autonomous haul control · sign in</div>
       <input id="login-user" placeholder="username" autocomplete="username" required>
       <input id="login-pass" type="password" placeholder="password" autocomplete="current-password" required>
       <button type="submit" class="primary">Sign in</button>
