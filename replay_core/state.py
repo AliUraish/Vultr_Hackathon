@@ -11,7 +11,7 @@ from typing import Any
 from .hashing import sha256
 from .policy import make_policy
 from .rng import seed_state
-from .world import MAP_HASH, ROBOT_SPECS, W, center
+from .world import GARAGE, MAP_HASH, ROBOT_SPECS, SPARE_SPECS, W, center
 
 STATE_FORMAT = 1
 # Bump whenever step() behaves differently: capsules recorded by another engine can't replay exactly.
@@ -34,6 +34,11 @@ def _robot(spec: dict, home: tuple[int, int]) -> dict:
     }
 
 
+def _spare(spec: dict, bay: tuple[int, int]) -> dict:
+    """A standby trailer parked in the garage: out of service until the control plane deploys it."""
+    return {**_robot(spec, bay), "status": "standby", "svc": "standby"}
+
+
 def initial_state(seed: int, policy: dict | None = None) -> State:
     return {
         "fmt": STATE_FORMAT,
@@ -43,7 +48,8 @@ def initial_state(seed: int, policy: dict | None = None) -> State:
         "seed": seed,
         "rng": seed_state(seed),
         "policy": policy or make_policy([], 1),
-        "robots": {s["id"]: _robot(s, W.homes[i]) for i, s in enumerate(ROBOT_SPECS)},
+        "robots": {**{s["id"]: _robot(s, W.homes[i]) for i, s in enumerate(ROBOT_SPECS)},
+                   **{s["id"]: _spare(s, GARAGE[i]) for i, s in enumerate(SPARE_SPECS)}},
         "pallets": [],
         "pallet_seq": 0,
         "known": [],          # obstacle cells the fleet has sensed (shared map)

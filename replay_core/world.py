@@ -66,6 +66,14 @@ ROBOT_SPECS: tuple[dict, ...] = (
     {"id": "R4", "caps": ["heavy", "standard"]},
 )
 
+# Maintenance: garage bays in the south-west corner; the standby spare parks in the first one.
+# Kept out of the map hash (like the spare) so capsules recorded before them still verify.
+GARAGE: tuple[tuple[int, int], ...] = ((1, 11), (2, 11), (3, 11))
+SPARE_SPECS: tuple[dict, ...] = ({"id": "R5", "caps": ["standard"]},)
+FAULT_SPEED = {"tire": 15, "sensor": 40}   # mm/tick under remote control: 0.15 m/s on a flat, 0.4 m/s half-blind
+FAULT_SENSOR_RANGE = 300                    # mm a degraded lidar still sees
+WHEELS = ("FL", "FR", "RL", "RR")
+
 Cell = tuple[int, int]
 
 
@@ -81,6 +89,7 @@ class World:
     cell_zones: dict[Cell, tuple[str, ...]]  # cell -> sorted zone names
     robot_caps: dict[str, frozenset[str]]
     map_hash: str
+    garage: tuple[tuple[int, int], ...] = GARAGE
 
     def passable(self, c: Cell) -> bool:
         return 0 <= c[0] < self.width and 0 <= c[1] < self.height and c not in self.blocked
@@ -94,6 +103,8 @@ class World:
             "homes": [list(h) for h in self.homes],
             "zones": self.zones,
             "robots": [{"id": s["id"], "caps": s["caps"]} for s in ROBOT_SPECS],
+            "spares": [{"id": s["id"], "caps": s["caps"]} for s in SPARE_SPECS],
+            "garage": [list(c) for c in self.garage],
             "map_hash": self.map_hash,
         }
 
@@ -157,7 +168,7 @@ def _build() -> World:
         width=width, height=height, blocked=frozenset(blocked), slots=slots, docks=docks,
         homes=tuple(homes), zones=zone_lists,
         cell_zones={c: tuple(sorted(z)) for c, z in cell_zones.items()},
-        robot_caps={s["id"]: frozenset(s["caps"]) for s in ROBOT_SPECS},
+        robot_caps={s["id"]: frozenset(s["caps"]) for s in ROBOT_SPECS + SPARE_SPECS},
         map_hash=digest,
     )
 

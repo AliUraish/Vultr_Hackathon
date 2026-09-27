@@ -82,6 +82,7 @@ def make_frame(state: State, events: list[Event], inputs: list[dict]) -> dict:
         s = r["step"]
         free = (
             r["estop"] == 0
+            and not r.get("fault") and not r.get("svc")
             and (s is None or s.get("internal", False))
             and all(q.get("internal", False) for q in r["queue"])
         )
@@ -90,6 +91,10 @@ def make_frame(state: State, events: list[Event], inputs: list[dict]) -> dict:
             "st": r["status"], "job": r["job"], "blk": r["blk"], "free": free,
             "carry": [i["sku"] for i in r["carry"]],
             "path": r["path"][r["k"]:r["k"] + 16] if r["path"] else [],
+            "res": [list(c) for c in r["res"]], "wait_on": r["wait_on"], "odo": r["odo"],
+            "op": s["op"] if s else None, "goal": (s.get("cell") or (W.slots[s["slot"]]["access"] if s.get("slot") in W.slots
+                                                 else W.docks.get(s.get("dock")))) if s else None,
+            "fault": r.get("fault"), "svc": r.get("svc"), "health": _health(state, r),
         })
     return {
         "t": state["tick"],
@@ -101,6 +106,38 @@ def make_frame(state: State, events: list[Event], inputs: list[dict]) -> dict:
         "ev": events,
         "in": inputs,
     }
+
+
+def _jitter(rid: str, tick: int, k: int, amp: float) -> float:
+    """Deterministic sensor noise: a pure function of robot, time and channel (no RNG state consumed)."""
+    h = (sum(ord(ch) * 131 for ch in rid) * (k + 17) + (tick // 10) * 2654435761 + k * 97) % 10007
+    return (h / 10007 - 0.5) * amp
+
+
+def _health(st: State, r: dict) -> dict:
+    """On-board health telemetry: tire pressures (psi), wheel slip (%), drive current imbalance (%),
+    chassis vibration (g), lidar return rate (%) and usable range (mm). Faults show up here first."""
+    t, rid = st["tick"], r["id"]
+    tires = {w: round(88 + _jitter(rid, t, i, 2.4), 1) for i, w in enumerate(wd.WHEELS)}
+    moving = r["v"] > 0
+    slip = round(1.2 + abs(_jitter(rid, t, 5, 1.6)) + (0.8 if moving else 0), 1)
+    imbalance = round(2 + abs(_jitter(rid, t, 6, 2.5)), 1)
+    vib = round(0.08 + abs(_jitter(rid, t, 7, 0.05)) + (0.06 if moving else 0), 2)
+    lidar = round(98.4 + _jitter(rid, t, 8, 1.8), 1)
+    rng = wd.SENSOR_RANGE
+    f = r.get("fault")
+    if f:
+        age = t - f.get("since", t)
+        if f["type"] == "tire":
+            w = f.get("wheel") or "FL"
+            tires[w] = round(max(14.0, 88 - age * 2.2 + _jitter(rid, t, 9, 1.0)), 1)
+            slip = round(21 + abs(_jitter(rid, t, 10, 6)) + (9 if moving else 0), 1)
+            imbalance = round(34 + abs(_jitter(rid, t, 11, 8)), 1)
+            vib = round(0.62 + abs(_jitter(rid, t, 12, 0.3)) + (0.5 if moving else 0), 2)
+        elif f["type"] == "sensor":
+            lidar = round(27 + _jitter(rid, t, 13, 8), 1)
+            rng = wd.FAULT_SENSOR_RANGE
+    return {"tires": tires, "slip": slip, "imbalance": imbalance, "vib": vib, "lidar": lidar, "range": rng}
 
 
 # ---------------------------------------------------------------- inputs
@@ -115,6 +152,8 @@ def _apply_input(st: State, inp: dict, ev: list[Event]) -> None:
             _abandon_job(st, r, ev, r["job"], "cancelled")
     elif kind == "chaos":
         _apply_chaos(st, inp, ev)
+    elif kind == "service":
+        _apply_service(st, inp, ev)
     elif kind == "policy":
         try:
             pol = make_policy(inp["rules"], inp["version"])
@@ -223,8 +262,73 @@ def _apply_chaos(st: State, inp: dict, ev: list[Event]) -> None:
     elif typ == "lift_zones":
         st["restricted"] = []
         ev.append({"type": "zones_lifted"})
+    elif typ == "robot_fault":
+        _apply_fault(st, inp, ev)
     else:
         ev.append({"type": "input_ignored", "kind": "chaos", "chaos": typ})
+
+
+_FAULT_CODE = {"tire": "E-DRV-217 traction anomaly", "sensor": "E-PER-104 perception degraded"}
+
+
+def _apply_fault(st: State, inp: dict, ev: list[Event]) -> None:
+    """A hardware fault: the robot safety-stops, releases its job to the fleet and raises an alarm.
+    The alarm code says what the robot noticed, not why; diagnosis reads the health telemetry."""
+    r = st["robots"].get(inp.get("robot"))
+    kind = inp.get("fault")
+    if r is None or r.get("fault") or r.get("svc") or kind not in wd.FAULT_SPEED:
+        ev.append({"type": "input_ignored", "kind": "fault", "robot": inp.get("robot")})
+        return
+    r["fault"] = {"type": kind, "since": st["tick"], **({"wheel": inp.get("wheel") or "FL"} if kind == "tire" else {})}
+    r["svc"] = "fault"
+    jid = r["job"]
+    if jid:
+        st["jobs"].pop(jid, None)
+        ev.append({"type": "job_released", "robot": r["id"], "job": jid, "held": [i["sku"] for i in r["carry"]]})
+    r.update(v=0, step=None, queue=[], job=None, path=[], k=0, replan=False, wait=0, wait_on="", blk=0,
+             status="fault", phase="", timer=0)
+    r["res"] = _overlap_cells(r)
+    ev.append({"type": "fault_alarm", "robot": r["id"], "cell": _cell(r), "code": _FAULT_CODE[kind], "job": jid})
+
+
+def _apply_service(st: State, inp: dict, ev: list[Event]) -> None:
+    """Service commands from the control plane: pull over / drive to the garage (remote control),
+    park as standby, deploy a standby robot, or mark a repair done."""
+    r = st["robots"].get(inp.get("robot"))
+    op = inp.get("op")
+    if r is None or op not in ("move", "standby", "deploy", "repair"):
+        ev.append({"type": "input_ignored", "kind": "service", "robot": inp.get("robot"), "op": op})
+        return
+    if op == "move":
+        cell = inp.get("cell")
+        if not (isinstance(cell, list) and len(cell) == 2 and W.passable((cell[0], cell[1]))):
+            ev.append({"type": "input_ignored", "kind": "service", "robot": r["id"], "op": op})
+            return
+        r["step"] = {"op": "goto", "cell": [cell[0], cell[1]], "svc": True}
+        r["queue"], r["replan"], r["held"] = [], True, False
+        r["svc"] = "remote"
+        ev.append({"type": "service_move", "robot": r["id"], "cell": [cell[0], cell[1]], "by": inp.get("by", "")})
+    elif op == "standby":
+        r.update(svc="standby", status="standby", v=0, step=None, queue=[], job=None, path=[], k=0)
+        r["home"] = _cell(r)
+        r["res"] = _overlap_cells(r)
+        ev.append({"type": "standby", "robot": r["id"], "cell": _cell(r)})
+    elif op == "deploy":
+        if r.get("fault"):
+            ev.append({"type": "input_ignored", "kind": "service", "robot": r["id"], "op": op})
+            return
+        r.pop("svc", None)
+        r["status"], r["idle"] = "idle", 0
+        ev.append({"type": "deployed", "robot": r["id"], "cell": _cell(r)})
+    else:  # repair
+        f = r.pop("fault", None)
+        held = [i["sku"] for i in r["carry"]]
+        r["carry"] = []  # anything held on board went back to stock during the repair
+        if r.get("svc") in ("fault", "remote"):
+            r.pop("svc", None)
+            r["status"], r["step"], r["path"], r["k"] = "idle", None, [], 0
+        ev.append({"type": "repaired", "robot": r["id"], "fault": (f or {}).get("type"), "by": inp.get("by", ""),
+                   "returned": held})
 
 
 def _expire_restrictions(st: State, ev: list[Event]) -> None:
@@ -254,6 +358,16 @@ def _robot_tick(st: State, r: dict, occ: dict[Cell, str], ev: list[Event]) -> No
         r["status"] = "estop"
         if r["estop"] == 0:
             r["replan"] = True
+        return
+    svc = r.get("svc")
+    if svc == "standby":  # parked in the garage, out of service
+        r["v"], r["status"], r["blk"] = 0, "standby", 0
+        return
+    if svc is not None and r["step"] is None:  # faulted: stay put until the control plane moves it
+        if svc == "remote":
+            r["svc"] = "fault"
+            ev.append({"type": "service_arrived", "robot": r["id"], "cell": _cell(r)})
+        r["v"], r["status"], r["blk"] = 0, "fault", 0
         return
     if r["step"] is None:
         _start_next(st, r, ev)
@@ -418,6 +532,7 @@ def _sense(st: State, r: dict, dx: int, dy: int) -> tuple[int, dict] | None:
     """Nearest pallet ahead within sensor range: (gap in mm, pallet)."""
     best: tuple[int, dict] | None = None
     reach = wd.ROBOT_HALF + wd.PALLET_HALF
+    sensor = wd.FAULT_SENSOR_RANGE if (r.get("fault") or {}).get("type") == "sensor" else wd.SENSOR_RANGE
     for p in st["pallets"]:
         px, py = center(p["cell"])
         along = (px - r["x"]) * dx + (py - r["y"]) * dy
@@ -425,7 +540,7 @@ def _sense(st: State, r: dict, dx: int, dy: int) -> tuple[int, dict] | None:
         if along <= 0 or lateral >= reach:
             continue
         gap = along - reach
-        if gap > wd.SENSOR_RANGE:
+        if gap > sensor:
             continue
         if best is None or gap < best[0]:
             best = (gap, p)
@@ -673,6 +788,8 @@ def _drive(st: State, r: dict, occ: dict[Cell, str], ev: list[Event]) -> None:
     limits: list[tuple[int, int]] = [(hard, 0)]
 
     vcap = _cap(st, _cell(r))
+    if r.get("fault"):  # limping under remote control
+        vcap = min(vcap, wd.FAULT_SPEED[r["fault"]["type"]])
     for idx in range(k, min(j, k + 3) + 1):
         cap = _cap(st, path[idx])
         boundary = along(path[idx]) - wd.HALF
@@ -701,6 +818,8 @@ def _drive(st: State, r: dict, occ: dict[Cell, str], ev: list[Event]) -> None:
         _trim_res(r, occ)
 
     if move > 0:
+        if r["wait"]:
+            ev.append({"type": "resume", "robot": r["id"], "after": r["wait"], "from": r["wait_on"]})
         r["blk"], r["wait"], r["wait_on"] = 0, 0, ""
         r["status"] = "moving"
         return
@@ -712,25 +831,37 @@ def _drive(st: State, r: dict, occ: dict[Cell, str], ev: list[Event]) -> None:
         r["blk"] += 1
     if blocked_by:
         r["status"] = "waiting"
+        other = st["robots"][blocked_by]
         if r["wait_on"] == blocked_by:
             r["wait"] += 1
         else:
             r["wait_on"], r["wait"] = blocked_by, 1
+            # Coordination is visible as events (they never feed back into the state):
+            # the cell we asked for is held by `blocked_by`, so we hold short of it.
+            want = next((path[i] for i in range(k, min(len(path), k + wd.LOOKAHEAD_CELLS))
+                         if occ.get(_t(path[i])) == blocked_by), path[k])
+            ev.append({"type": "wait", "robot": r["id"], "on": blocked_by, "cell": list(want),
+                       "other_moving": other["v"] > 0})
+            if other["wait_on"] == r["id"] and other["wait"] > 0:
+                ev.append({"type": "standoff", "robot": r["id"], "with": blocked_by, "cell": _cell(r)})
         # Re-route around the blocker. Who goes first: anyone blocked by a parked robot;
         # in a head-on standoff the higher id, then the lower id if that failed; in a
         # longer chain, anyone who has waited long enough. Retries every YIELD_TICKS.
-        other = st["robots"][blocked_by]
         mutual = other["wait_on"] == r["id"] and other["wait"] > 0
-        if _stationary(other) or (mutual and r["id"] > other["id"]):
-            patience = wd.YIELD_TICKS
+        if _stationary(other):
+            patience, rule = wd.YIELD_TICKS, "parked"
+        elif mutual and r["id"] > other["id"]:
+            patience, rule = wd.YIELD_TICKS, "head_on"
         elif mutual:
-            patience = 2 * wd.YIELD_TICKS
+            patience, rule = 2 * wd.YIELD_TICKS, "head_on_retry"
         else:
-            patience = 3 * wd.YIELD_TICKS
+            patience, rule = 3 * wd.YIELD_TICKS, "queue"
         if r["wait"] >= patience and (r["wait"] - patience) % wd.YIELD_TICKS == 0:
             r["avoid_tmp"] = [list(c) for c in other["res"]]
             r["yield_from"] = other["id"]
             r["replan"] = True
+            ev.append({"type": "yield", "robot": r["id"], "to": other["id"], "rule": rule, "waited": r["wait"],
+                       "cell": _cell(r)})
     else:
         r["status"] = "blocked" if obstacle_limited else "waiting"
 

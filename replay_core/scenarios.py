@@ -23,6 +23,8 @@ SCENARIOS: dict[str, str] = {
     "mislabel_bin": "A bin gets the wrong item; a robot on its way there picks it (wrong item at dock).",
     "worker_in_aisle": "A worker closes an aisle that a robot is already routed through (zone breach).",
     "clear_floor": "Remove pallets, fix bin labels, reopen aisles.",
+    "tire_fault": "A working trailer gets a flat tire: it can only crawl (service case: technician repair).",
+    "sensor_fault": "A working trailer's lidar degrades: it can still drive slowly (service case: garage + spare).",
 }
 
 _DIRS = {"E": (1, 0), "W": (-1, 0), "S": (0, 1), "N": (0, -1)}
@@ -37,8 +39,8 @@ def _pallet_drop(state: dict, hints: dict[str, Any]) -> list[dict] | None:
     zone = hints.get("zone", "racks")
     min_v = max(1, int(hints.get("min_v", 100)))
     lo, hi = 250, 420
-    if "gap_mm" in hints:  # re-inject: the same gap the original pallet appeared at
-        lo, hi = max(lo, int(hints["gap_mm"]) - 30), min(hi, int(hints["gap_mm"]) + 30)
+    if "gap_mm" in hints:  # re-inject / stress variant: a chosen gap between robot and pallet
+        lo, hi = max(120, int(hints["gap_mm"]) - 30), min(600, int(hints["gap_mm"]) + 30)
     fast = []
     for rid in sorted(robots):
         r = robots[rid]
@@ -53,6 +55,8 @@ def _pallet_drop(state: dict, hints: dict[str, Any]) -> list[dict] | None:
         r = robots[rid]
         dx, dy = _DIRS[r["dir"]]
         path, k = r["path"], r["k"]
+        if k >= len(path):  # arriving this tick: nothing ahead
+            continue
         j = k
         while j + 1 < len(path) and path[j + 1][0] - path[j][0] == dx and path[j + 1][1] - path[j][1] == dy:
             j += 1
@@ -112,6 +116,22 @@ def _worker_in_aisle(state: dict, hints: dict[str, Any]) -> list[dict] | None:
     return None
 
 
+def _robot_fault(kind: str):
+    def resolve_fault(state: dict, hints: dict[str, Any]) -> list[dict] | None:
+        """Pick a trailer that is out working (moving, on a job, not already in service)."""
+        want = hints.get("robot")
+        for rid in sorted(state["robots"]):
+            r = state["robots"][rid]
+            if (want and rid != want) or r.get("fault") or r.get("svc") or not r["job"]:
+                continue
+            if r["v"] > 0 and r["step"] and r["step"]["op"] == "goto":
+                wheel = ("FL", "FR", "RL", "RR")[(state["tick"] + len(rid)) % 4]
+                return [_chaos(f"{kind}_fault", rid, type="robot_fault", robot=rid, fault=kind,
+                               **({"wheel": wheel} if kind == "tire" else {}))]
+        return None
+    return resolve_fault
+
+
 def _clear_floor(state: dict, hints: dict[str, Any]) -> list[dict]:
     return [
         _chaos("clear_floor", None, type="clear_pallets"),
@@ -125,6 +145,8 @@ _RESOLVERS = {
     "mislabel_bin": _mislabel_bin,
     "worker_in_aisle": _worker_in_aisle,
     "clear_floor": _clear_floor,
+    "tire_fault": _robot_fault("tire"),
+    "sensor_fault": _robot_fault("sensor"),
 }
 
 
@@ -144,6 +166,7 @@ def check_hints(hints: dict[str, Any]) -> dict[str, Any]:
         "now": lambda v: isinstance(v, bool),
         "fallback_zone": lambda v: isinstance(v, str) and v in W.zones,
         "fallback_after": lambda v: isinstance(v, int) and 0 <= v <= 1200,
+        "robot": lambda v: isinstance(v, str) and v in W.robot_caps,
     }
     for k, v in hints.items():
         if k not in rules or not rules[k](v):
