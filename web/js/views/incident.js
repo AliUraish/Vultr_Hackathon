@@ -79,7 +79,7 @@ async function load() {
 
 function selectReplay(r) {
   selected = r.id;
-  const cap = r.kind === "proof" ? `Replay #${r.id} under policy v${r.policy_version}` : `Exact replay #${r.id}`;
+  const cap = r.kind === "proof" ? `Replay #${r.id} under haul rules v${r.policy_version}` : `Exact replay #${r.id}`;
   viewer.setReplay(frames[r.id] || [], cap, `${r.worker || "VM B"} · ${r.duration_ms ?? "–"} ms`);
 }
 
@@ -88,7 +88,7 @@ function renderActions(f, cap) {
   const terminal = ["fixed", "dismissed", "lost", "not_reproducible"].includes(f.status);
   const add = (label, cls, fn, on = true) => { const b = document.createElement("button"); b.textContent = label; b.className = cls; b.disabled = !on; b.onclick = fn; el.append(b); };
   add("Replay again", "primary", () => act(() => api(`/api/failures/${f.id}/replay`, { body: {} }), "Replay queued on VM B"), !!cap);
-  if (f.scenario) add("Re-inject live", "", () => act(() => api(`/api/failures/${f.id}/reinject`, { body: {} }), "Recreating the original situation on the live floor"));
+  if (f.scenario) add("Re-inject live", "", () => act(() => api(`/api/failures/${f.id}/reinject`, { body: {} }), "Recreating the original situation in the live pit"));
   if (["trials", "awaiting_approval", "no_fix"].includes(f.status)) add("Investigate again", "", () => act(() => api(`/api/failures/${f.id}/diagnose`, { body: {} }), "New investigation started"));
   if (!terminal) add("Dismiss", "", () => act(() => api(`/api/failures/${f.id}/dismiss`, { body: {} }), "Dismissed"));
 }
@@ -101,16 +101,16 @@ function renderImpact(d) {
   impactSig = sig;
   if (!im) { $("#inc-impact").innerHTML = ""; return; }
   const mism = d.failure.type === "wrong_item" && det.expected ? `<div class="mism">
-      <span class="hint">ordered</span><span>${(det.expected || []).map((x) => esc(itemLabel(x))).join(", ")}</span>
-      <span class="hint">picked</span><span class="bad">${(det.actual || []).map((x) => esc(itemLabel(x))).join(", ") || "–"}</span></div>` : "";
+      <span class="hint">should be</span><span>${(det.expected || []).map((x) => esc(itemLabel(x))).join(", ")}</span>
+      <span class="hint">was loaded</span><span class="bad">${(det.actual || []).map((x) => esc(itemLabel(x))).join(", ") || "–"}</span></div>` : "";
   $("#inc-impact").innerHTML = `<div class="impact">
     <div class="cost"><span class="hint">estimated cost of this incident</span><b>${money(im.estimated_cost_usd)}</b><span class="hint">${esc(im.basis)}</span></div>
     ${o ? `<div class="ord">
       <div class="row wrap"><span class="mono">${esc(o.id)}</span><b>${esc(o.customer)}</b>${pill(o.tier, TIER[o.tier] || "")}
-        ${o.priority === "expedite" ? pill("expedite", "warn") : ""}<span class="hint">${o.sla_hours} h SLA · ship by ${new Date(o.ship_by).toLocaleString()}</span></div>
-      <div class="lines">${o.lines.map((l) => `${l.qty} × ${esc(l.name)} <span class="mono dim">${esc(l.sku)} · ${esc(l.slot)}</span>`).join("<br>")}</div>
+        ${o.priority === "expedite" ? pill("expedite", "warn") : ""}<span class="hint">for ${esc(o.customer)}</span></div>
+      <div class="lines">${o.lines.map((l) => `${l.qty} t ${esc(l.name)} <span class="mono dim">${esc(l.sku)} · ${esc(l.slot)}</span>`).join("<br>")}</div>
       <div class="hint">${money(o.value, 2)} · ${esc(o.carrier)} → ${esc(o.dock)} · order is ${esc(o.status.replace("_", " "))}</div>
-    </div>` : `<div class="ord hint">No customer order was in progress.</div>`}
+    </div>` : `<div class="ord hint">No load ticket was in progress.</div>`}
     ${mism}</div>`;
 }
 
@@ -163,7 +163,7 @@ function renderHyps(d) {
   const sig = JSON.stringify(hyps.map((h) => [h.id, h.status, h.gate, trialOf(h)?.status, trialOf(h)?.id in frames]));
   const src = hyps[0]?.source || "";
   const [prov, model] = src.split(":");
-  const who = { playbook: "the rule playbook", openai: "the investigator · OpenAI", vultr: "the investigator · Vultr Inference", scripted: "the scripted investigator" }[prov] || prov;
+  const who = { playbook: "the rule playbook", vultr: "the investigator · Vultr Serverless Inference", scripted: "the scripted investigator" }[prov] || prov;
   $("#inc-source").textContent = hyps.length ? `proposed by ${who}${model ? ` · ${model}` : ""}` : "";
   if (sig === hypSig) return;
   hypSig = sig;
@@ -212,7 +212,7 @@ function renderHyps(d) {
   for (const b of $$("#inc-hyps button.approve")) {
     b.onclick = async () => {
       b.disabled = true;
-      const r = await act(() => api(`/api/hypotheses/${b.dataset.id}/approve`, { body: {} }), (x) => `Policy v${x.result.version} is live on the fleet`);
+      const r = await act(() => api(`/api/hypotheses/${b.dataset.id}/approve`, { body: {} }), (x) => `Haul rules v${x.result.version} are live on the fleet`);
       if (!r) b.disabled = false;
       reload();
     };

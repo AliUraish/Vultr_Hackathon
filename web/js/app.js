@@ -8,7 +8,6 @@ import * as incidentView from "./views/incident.js";
 import * as suiteView from "./views/suite.js";
 import * as logView from "./views/log.js";
 import * as policyView from "./views/policy.js";
-import * as platformView from "./views/platform.js";
 
 const VIEWS = {
   live: { mod: liveView, nav: "live" },
@@ -18,7 +17,6 @@ const VIEWS = {
   regression: { mod: suiteView, nav: "regression" },
   log: { mod: logView, nav: "log" },
   policy: { mod: policyView, nav: "policy" },
-  platform: { mod: platformView, nav: "platform" },
 };
 const ALIASES = { inbox: "incidents", failure: "incident" };
 const mounted = new Set();
@@ -45,13 +43,20 @@ async function refreshState() {
   try { st = await api("/api/state"); } catch { return; }
   live.seed(st.frame);
   const chip = $("#policy-chip");
-  chip.innerHTML = `policy v${st.policy.version}${st.policy.signed ? ' <span class="sig" title="signed ed25519">✓</span>' : ""}`;
+  chip.innerHTML = `rules v${st.policy.version}${st.policy.signed ? ' <span class="sig" title="signed ed25519">✓</span>' : ""}`;
+  if (st.ai) {
+    const model = String(st.ai.model || "").replace(/-\d{4}$/, "").replace(/-/g, " ");
+    $("#ai-text").textContent = st.ai.enabled ? `${st.ai.provider === "vultr" ? "Vultr AI" : st.ai.provider} · ${model}` : "rules only";
+    $("#ai-chip").title = st.ai.enabled ? `Every dispatch, right-of-way ruling, fault recovery and investigation runs on ${st.ai.provider === "vultr" ? "Vultr Serverless Inference" : st.ai.provider} · ${st.ai.model}` : "No model configured: the rules decide";
+    $("#ai-chip").classList.toggle("off", !st.ai.enabled);
+  }
   chip.title = (st.policy.rules.join("\n") || "no rules") + (st.policy.signed ? `\nsigned · key ${st.policy.key_id}` : "\nunsigned");
   if (st.site && !cfg.site) loadSite();
   if (lastPolicy !== null && lastPolicy !== st.policy.version) { chip.classList.remove("flash"); void chip.offsetWidth; chip.classList.add("flash"); }
   lastPolicy = st.policy.version;
   $("#sim-chip").classList.toggle("online", st.sim_online);
-  $("#sim-text").textContent = st.sim_online ? `sim live · ${st.run_id}` : "sim offline";
+  $("#sim-text").textContent = st.sim_online ? "fleet live · 10 Hz" : "fleet offline";
+  $("#sim-chip").title = st.sim_online ? `live sim on VM B · run ${st.run_id}` : "the sim on VM B is not streaming";
   countTo($("#tick-num"), st.tick, { ms: 1800 });
   const badge = $("#inbox-badge");
   badge.hidden = !st.open_failures; badge.textContent = st.open_failures;
@@ -72,7 +77,14 @@ function wireLive() {
       if (current === "regression") suiteView.refresh();
     });
   }
-  bus.on("policy", (d) => toast(`Policy v${d.version} pushed to the fleet`, "ok"));
+  bus.on("policy", (d) => toast(`Haul rules v${d.version} pushed to the fleet`, "ok"));
+  bus.on("usage", (u) => {
+    $("#spend-calls").textContent = u.calls_total.toLocaleString();
+    $("#spend-cpm").textContent = Math.round(u.calls_per_min).toLocaleString();
+    $("#spend-chip").title = `Vultr Serverless Inference since ${u.since.slice(0, 16).replace("T", " ")} UTC: `
+      + `${u.calls_total.toLocaleString()} calls, ${(u.tokens_total / 1e6).toFixed(1)}M tokens; now ${u.calls_per_min} calls/min, `
+      + `${Math.round(u.tokens_per_min / 1000).toLocaleString()}k tokens/min.`;
+  });
   bus.on("notice", (d) => toast(d.message || d.type, "warn"));
   bus.on("auth", showLogin);
   bus.on("site", () => { if (!cfg.site || !cfg.site.catalog) loadSite(); });
@@ -82,9 +94,9 @@ function wireLive() {
 async function loadSite() {
   try { cfg.site = await api("/api/site"); } catch { return; }
   const f = cfg.site.facility;
-  $("#site-chip").innerHTML = `${esc(f.company)} <span class="code">${esc(cfg.site.code)}</span>`;
-  $("#site-chip").title = `${cfg.site.name}\n${f.description}\n${f.city} · ${Number(f.sq_ft).toLocaleString()} sq ft · profile by ${cfg.site.source}`;
-  document.title = `Replay · ${cfg.site.code} ${cfg.site.name}`;
+  $("#site-chip").innerHTML = `${esc(cfg.site.name)} <span class="code">${esc(cfg.site.code)}</span>`;
+  $("#site-chip").title = `${f.company} · ${cfg.site.name}\n${f.description}\n${f.location} · ${f.commodity} · profile by ${cfg.site.source}`;
+  document.title = `Replay · ${cfg.site.name} (${cfg.site.code})`;
   bus.emit("site", cfg.site);
 }
 
@@ -108,7 +120,7 @@ async function boot() {
     if (e.target.matches("input, select, textarea")) return;
     const v = VIEWS[current];
     if (v && v.mod.onKey && v.mod.onKey(e)) { e.preventDefault(); return; }
-    const nav = { "1": "live", "2": "floor", "3": "incidents", "4": "regression", "5": "log", "6": "policy", "7": "platform" }[e.key];
+    const nav = { "1": "live", "2": "floor", "3": "incidents", "4": "regression", "5": "log", "6": "policy" }[e.key];
     if (nav && !e.altKey && !e.metaKey && !e.ctrlKey) location.hash = `#/${nav}`;
   });
   route();
