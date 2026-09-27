@@ -67,8 +67,9 @@ async def telemetry(rt: Runtime, body: dict) -> dict:
         for t in ticks:
             tick = t["tick"]
             for inp in t["inputs"]:
-                pending.append((run_id, tick - 1, inp.get("robot") or inp.get("target"),
-                                f"input.{inp.get('kind')}", inp))
+                if inp.get("kind") != "advice":   # AI speed advice: several a second; kept in the tick record, not the event log
+                    pending.append((run_id, tick - 1, inp.get("robot") or inp.get("target"),
+                                    f"input.{inp.get('kind')}", inp))
                 if inp.get("kind") == "cmd" and inp.get("job"):
                     await c.execute(
                         "UPDATE jobs SET status = 'active', assigned_tick = $2, robot_id = $3, run_id = $4 "
@@ -77,7 +78,7 @@ async def telemetry(rt: Runtime, body: dict) -> dict:
                     await c.execute("UPDATE orders SET status = 'picking' WHERE job_id = $1 AND status = 'released'",
                                     inp["job"]["id"])
             for e in t["frame"]["ev"]:
-                if e["type"] == "cmd":
+                if e["type"] in ("cmd", "advice"):
                     continue  # same fact as the input above
                 pending.append((run_id, tick, e.get("robot"), f"sim.{e['type']}", e))
                 if e["type"] == "job_done" and e.get("job"):
@@ -85,7 +86,7 @@ async def telemetry(rt: Runtime, body: dict) -> dict:
                                     e["job"], "done" if e["ok"] else "wrong_item", tick, e)
                     await c.execute("UPDATE orders SET status = $2, shipped_at = now() WHERE job_id = $1",
                                     e["job"], "shipped" if e["ok"] else "short_shipped")
-                elif e["type"] == "job_released" and e.get("job"):  # a faulted robot hands its job back
+                elif e["type"] == "job_released" and e.get("job"):  # a faulted truck hands its load back
                     await c.execute("UPDATE jobs SET status = 'pending', robot_id = NULL, created_tick = NULL "
                                     "WHERE id = $1 AND status IN ('assigned', 'active')", e["job"])
                     await c.execute("UPDATE orders SET status = 'released' WHERE job_id = $1 AND status = 'picking'", e["job"])
@@ -117,6 +118,9 @@ async def telemetry(rt: Runtime, body: dict) -> dict:
         rt.frame, rt.last_tick, rt.frame_at = ticks[-1]["frame"], ticks[-1]["tick"], time.monotonic()
     rt.sim_policy_version = body.get("policy_version")
     rt.sim_host = body.get("host") or rt.sim_host
+    if rt.traffic is not None and run_id == rt.run_id:
+        for t in ticks:
+            rt.traffic.observe(t["frame"])
     if rt.service is not None:
         for t in ticks:
             rt.service.observe(t["frame"])

@@ -61,10 +61,26 @@ class Runtime:
     sim_policy_version: int | None = None  # policy the live sim reports it is running
     auto_jobs: bool = True
     inflight: dict[str, float] = field(default_factory=dict)  # robot -> when we dispatched to it
+    dispatcher: Any = None                 # control.fleet.Dispatcher
+    traffic: Any = None                    # control.traffic.TrafficDesk
+    faces: dict[str, dict] = field(default_factory=dict)      # dig face -> {trucks coming, seconds alone}
+    decisions: deque = field(default_factory=lambda: deque(maxlen=120))  # recent AI / rule decisions for the UI
+    aiops: Any = None                      # control.aiops.AIOps: AI drivers, auditor, road crew, supervisor...
+    decision_seq: int = 0
+
+    def decide(self, d: dict) -> None:
+        """Record a decision (dispatch, traffic, service, roads, hazard, autopilot...), stream it to the browsers
+        and queue it for the auditor model."""
+        self.decision_seq += 1
+        d = {"id": self.decision_seq, "at": time.time(), "tick": self.last_tick, **d}
+        self.decisions.append(d)
+        self.hub.publish("decision", d)
+        if self.aiops is not None:
+            self.aiops.auditor.submit(d)
 
     @property
     def sim_online(self) -> bool:
-        return self.frame is not None and time.monotonic() - self.frame_at < 3.0
+        return self.frame is not None and time.monotonic() - self.frame_at < 10.0
 
     def status(self) -> dict[str, Any]:
         return {"run_id": self.run_id, "tick": self.last_tick, "sim_online": self.sim_online,

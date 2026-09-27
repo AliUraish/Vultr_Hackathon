@@ -1,15 +1,16 @@
-"""The enterprise this deployment runs, and the orders that drive the fleet.
+"""The mine this deployment runs, and the load tickets that drive the haul fleet.
 
-Each database gets its own site, generated once: a fictional company and facility (picked at
-random from a set of industries and cities), the SKU in every rack slot (consistent with the
-slot's handling class), customers with service tiers, the carrier at each dock door, the robot
-asset register, the shift roster and a cost model. The configured model writes it against a
-strict JSON schema; the answer is validated and anything missing is filled in by a seeded
+Each database gets its own mine, generated once: a fictional mining company and pit
+(picked at random from a set of commodities and regions), the material at every dig
+face (consistent with the face's class: ore, low-grade, waste or sand), the excavator
+at each face, the destination at each dump point, offtake buyers, the truck asset
+register, the crew and a cost model. The configured model writes it against a strict
+JSON schema; the answer is validated and anything missing is filled in by a seeded
 generator, which also produces the whole profile when there is no key or the call fails.
 
-Orders are generated continuously from that profile (weighted customers, 1-2 lines, quantities by
-handling class), become pick jobs for the robots, and are closed by the fleet's telemetry. An
-incident is priced from the order it hit and the cost model.
+Load tickets are raised continuously by the dig faces (each excavator wants a truck
+under it and one on the way), become haul loads for the trucks, and are closed by the
+fleet's telemetry. An incident is priced from the load it hit and the cost model.
 """
 from __future__ import annotations
 
@@ -23,29 +24,33 @@ from typing import Any
 import asyncpg
 import httpx
 
-from replay_core.world import ITEM_CLASSES, ROBOT_SPECS, W
+from replay_core.world import DESTINATION, ITEM_CLASSES, ROBOT_SPECS, SPARE_SPECS, W
 
 from .config import Settings
 from .db import log_event
+from .usage import USAGE
 
 log = logging.getLogger("replay.enterprise")
 
-INDUSTRIES = (
-    "medical and surgical supplies distribution", "consumer electronics e-commerce fulfilment",
-    "automotive aftermarket parts distribution", "specialty grocery and beverage distribution",
-    "industrial MRO (maintenance, repair, operations) supplies", "pharmacy and health retail replenishment",
-    "home improvement and hardware retail", "outdoor and sporting goods e-commerce",
-    "laboratory and life-science consumables", "beauty and personal care fulfilment",
-)
-CITIES = ("Fremont, CA", "Reno, NV", "Tracy, CA", "Ontario, CA", "Phoenix, AZ", "Salt Lake City, UT",
-          "Dallas, TX", "Columbus, OH", "Memphis, TN", "Allentown, PA", "Indianapolis, IN", "Savannah, GA")
+COMMODITIES = {
+    "copper": ("copper sulphide ore", "% Cu", (0.6, 1.8)),
+    "iron ore": ("hematite iron ore", "% Fe", (56.0, 64.0)),
+    "gold": ("gold-bearing ore", "g/t Au", (0.8, 4.5)),
+    "metallurgical coal": ("run-of-mine coking coal", "% ash", (8.0, 14.0)),
+    "lithium": ("spodumene pegmatite ore", "% Li2O", (1.0, 1.6)),
+    "zinc-lead": ("zinc-lead sulphide ore", "% Zn", (4.0, 9.0)),
+}
+REGIONS = ("Pilbara, Western Australia", "Bowen Basin, Queensland", "Atacama, Chile", "Elko County, Nevada",
+           "Sudbury Basin, Ontario", "South Gobi, Mongolia", "Kalgoorlie, Western Australia", "Arizona Copper Belt",
+           "Hunter Valley, New South Wales", "Carajás, Brazil")
 TIERS = {"platinum": 4, "gold": 8, "standard": 24}
 CLASS_HINT = {
-    "boxed": "sealed cartons and boxed goods (sturdy, mid weight)",
-    "loose_small": "small loose items that look alike (easy to mix up)",
-    "fragile": "fragile items (glass, electronics, instruments)",
-    "heavy": "heavy or bulky items (only the heavy-lift robot can carry them)",
+    "ore": "the high-grade ore the plant is paid for (goes to the primary crusher)",
+    "lowgrade": "low-grade ore stockpiled for later processing (goes to the ROM stockpile)",
+    "waste": "overburden and waste rock with no value (goes to the waste dump)",
+    "sand": "sand and gravel sold as construction aggregate (goes to the sand stockpile)",
 }
+DOCK_KIND = {"DK1": "primary crusher", "DK2": "ROM stockpile", "DK3": "waste dump", "DK4": "sand stockpile"}
 
 
 def slot_spec() -> list[dict]:
@@ -62,13 +67,16 @@ def _obj(props: dict, required: list[str] | None = None) -> dict:
 SCHEMA = _obj({
     "facility": _obj({
         "company": {"type": "string"}, "name": {"type": "string"}, "code": {"type": "string"},
-        "city": {"type": "string"}, "sq_ft": {"type": "integer"}, "description": {"type": "string"},
+        "location": {"type": "string"}, "commodity": {"type": "string"}, "description": {"type": "string"},
         "shifts": {"type": "array", "items": {"type": "string"}},
     }),
     "catalog": {"type": "array", "items": _obj({
         "slot": {"type": "string"}, "sku": {"type": "string"}, "name": {"type": "string"},
-        "category": {"type": "string"}, "uom": {"type": "string"},
+        "category": {"type": "string"}, "grade": {"type": "string"},
         "unit_value": {"type": "number"}, "unit_weight": {"type": "number"},
+    })},
+    "excavators": {"type": "array", "items": _obj({
+        "slot": {"type": "string"}, "id": {"type": "string"}, "model": {"type": "string"}, "bucket_m3": {"type": "number"},
     })},
     "customers": {"type": "array", "items": _obj({
         "name": {"type": "string"}, "segment": {"type": "string"},
@@ -79,9 +87,9 @@ SCHEMA = _obj({
         "service": {"type": "string"}, "cutoff": {"type": "string"},
     })},
     "robots": {"type": "array", "items": _obj({
-        "id": {"type": "string", "enum": [r["id"] for r in ROBOT_SPECS]}, "model": {"type": "string"},
+        "id": {"type": "string", "enum": [r["id"] for r in ROBOT_SPECS + SPARE_SPECS]}, "model": {"type": "string"},
         "serial": {"type": "string"}, "firmware": {"type": "string"}, "commissioned": {"type": "string"},
-        "payload_kg": {"type": "integer"},
+        "payload_t": {"type": "integer"},
     })},
     "associates": {"type": "array", "items": _obj({
         "name": {"type": "string"}, "role": {"type": "string"}, "shift": {"type": "string"},
@@ -94,26 +102,28 @@ SCHEMA = _obj({
 })
 
 
-def prompt(industry: str, city: str) -> str:
-    slots = ", ".join(f"{s['slot']}={s['cls']}" for s in slot_spec())
-    return f"""Create the operating profile of a fictional company's robotic fulfilment centre.
-Industry: {industry}. Location: {city}. Invent names; never use real company or brand names.
+def prompt(commodity: str, region: str) -> str:
+    faces = ", ".join(f"{s['slot']}={s['cls']}" for s in slot_spec())
+    docks = ", ".join(f"{d}={DOCK_KIND[d]}" for d in sorted(W.docks))
+    return f"""Create the operating profile of a fictional open-pit mine run by autonomous haul trucks.
+Commodity: {commodity}. Region: {region}. Invent names; never use real company, mine or equipment brand names.
 
-facility: company name, facility name, a short site code (like "FRE-2"), city, floor area, one-line
-description, 2-3 shift names with hours.
-catalog: exactly one product per rack slot, {len(W.slots)} total, matching the slot's handling class:
-{slots}
+facility: company name, mine name (e.g. "<Name> Pit"), a short site code (like "PIL-3"), location, commodity,
+one-line description, 2-3 shift names with hours.
+catalog: exactly one material per dig face, {len(W.slots)} total, matching the face's class: {faces}.
 Classes: {'; '.join(f'{k} = {v}' for k, v in CLASS_HINT.items())}.
-Each product: an SKU code in a consistent house format, a specific realistic product name with size or
-pack count, a category, a unit of measure (each, box, case, pack...), unit value in USD and unit weight in kg.
-Neighbouring loose_small slots should hold look-alike items (e.g. the same part in two sizes).
-customers: 10 business customers of this company with segment and tier (platinum, gold or standard;
-few platinum). carriers: one per dock door {', '.join(sorted(W.docks))}, with carrier name, service
-level and daily cutoff time. robots: {', '.join(r['id'] for r in ROBOT_SPECS)}; R1-R3 are standard
-autonomous mobile robots (payload 60-150 kg), R4 is a heavy-lift model (payload 400-1000 kg); invent a
-fleet vendor model name, serial, firmware version and commissioning date for each.
-associates: 6 people on the floor team (shift lead, safety officer, inventory control, maintenance tech,
-fleet engineer, dock supervisor). cost_model: realistic USD figures for this business."""
+Each material: a material code (sku) in a consistent format, a specific name, a category, a grade string with units
+(e.g. "1.1% Cu" or "waste, 0.1% Cu"), value in USD per tonne (waste is 0) and tonnes per truck load (220-290).
+excavators: one per face (slot A-D), an id like EX-01, an invented hydraulic excavator model, bucket size m3 (28-42).
+customers: 4 offtake buyers for the saleable products (smelters, steel mills, traders, concrete producers) with
+segment and tier (platinum, gold or standard; one platinum at most), plus "Mine operations (internal)" as standard.
+carriers: one destination per dump point: {docks}; carrier = the destination's name (e.g. "Primary crusher CR-1"),
+service = what it takes, cutoff = its throughput (e.g. "3,200 t/h").
+robots: {', '.join(r['id'] for r in ROBOT_SPECS + SPARE_SPECS)} are identical autonomous ultra-class haul trucks
+(payload 220-290 t; the last one is the standby spare); invent the model name, serials, firmware and commissioning dates.
+associates: 7 people on the crew (shift supervisor, fleet dispatcher, maintenance fitter, tyre fitter, blast
+coordinator, grade control geologist, safety officer). cost_model: realistic USD figures for this mine
+(downtime per truck-minute, a truck collision, a misrouted load, a recordable safety incident, a late load)."""
 
 
 # ---------------------------------------------------------------- model call
@@ -123,88 +133,74 @@ async def _ask(settings: Settings, text: str, transport: httpx.AsyncBaseTranspor
     headers = {"Authorization": f"Bearer {settings.inference_key}"}
     async with httpx.AsyncClient(headers=headers, timeout=180.0, transport=transport) as http:
         model = await _pick_model(http, settings)
-        if settings.inference_provider == "openai":
-            body: dict[str, Any] = {
-                "model": model, "input": text, "max_output_tokens": 16000, "reasoning": {"effort": "low"},
-                "text": {"format": {"type": "json_schema", "name": "site_profile", "schema": SCHEMA, "strict": True}}}
-            r = await http.post(f"{settings.inference_url}/responses", json=body)
-            if r.status_code == 400 and "reasoning" in r.text:
-                body.pop("reasoning")
-                r = await http.post(f"{settings.inference_url}/responses", json=body)
-            r.raise_for_status()
-            data = r.json()
-            out = "".join(c.get("text", "") for item in data.get("output") or [] if item.get("type") == "message"
-                          for c in item.get("content") or [] if c.get("type") == "output_text")
-            usage = data.get("usage") or {}
-            log.info("site profile from %s: %s in / %s out tokens", model, usage.get("input_tokens"),
-                     usage.get("output_tokens"))
-        else:
-            body = {"model": model, "temperature": 0.9, "max_tokens": 6000,
-                    "response_format": {"type": "json_object"},
-                    "messages": [{"role": "system", "content": "Answer with one JSON object with the keys "
-                                  + ", ".join(SCHEMA["properties"]) + "."},
-                                 {"role": "user", "content": text}]}
+        body = {"model": model, "temperature": 0.8, "max_tokens": 4000,
+                "response_format": {"type": "json_object"},
+                "messages": [{"role": "system", "content": "Answer with one JSON object with the keys "
+                              + ", ".join(SCHEMA["properties"]) + ". Keep every text field short."},
+                             {"role": "user", "content": text}]}
+        r = await http.post(f"{settings.inference_url}/chat/completions", json=body)
+        if r.status_code == 400 and "response_format" in r.text:
+            body.pop("response_format")
             r = await http.post(f"{settings.inference_url}/chat/completions", json=body)
-            r.raise_for_status()
-            out = r.json()["choices"][0]["message"]["content"] or ""
+        r.raise_for_status()
+        data = r.json()
+        u = data.get("usage") or {}
+        USAGE.record("site_profile", int(u.get("prompt_tokens") or 0), int(u.get("completion_tokens") or 0))
+        out = data["choices"][0]["message"]["content"] or ""
         return json.loads(out[out.find("{"):out.rfind("}") + 1]), f"{settings.inference_provider}:{model}"
 
 
 # ---------------------------------------------------------------- fallback generator
 
-_WORDS = {
-    "boxed": (["Carton", "Case", "Kit", "Box", "Pack"], ["Shipping Labels", "Nitrile Gloves", "Filter Cartridges",
-              "Cable Ties", "Printer Toner", "Hand Sanitizer", "Batteries AA", "Cleaning Wipes"]),
-    "loose_small": (["M4", "M5", "M6", "3/8\"", "1/2\"", "10 mm", "12 mm"], ["Hex Bolt", "Lock Nut", "Hose Clamp",
-                    "Fuse 10A", "Fuse 15A", "O-Ring", "Spacer", "Cable Gland"]),
-    "fragile": (["Borosilicate", "Tempered", "Precision", "OLED", "Ceramic"], ["Beaker 500 ml", "Display Panel",
-                "Sensor Module", "Glass Vial Tray", "Lens Assembly", "Thermometer", "Tablet", "Light Fixture"]),
-    "heavy": (["Pallet", "Drum", "Bulk", "Industrial"], ["Motor Assembly", "Hydraulic Pump", "Coolant 55 gal",
-              "Steel Plate", "Compressor", "Battery Pack 48V", "Gearbox", "Generator"]),
+_MATERIAL = {
+    "ore": ("{c} (high grade)", "ore"), "lowgrade": ("{c} (low grade)", "low-grade ore"),
+    "waste": ("Overburden waste rock", "waste"), "sand": ("Washed construction sand", "aggregate"),
 }
-_VALUE = {"boxed": (8, 90), "loose_small": (0.4, 12), "fragile": (25, 480), "heavy": (180, 2600)}
-_WEIGHT = {"boxed": (1, 14), "loose_small": (0.01, 0.4), "fragile": (0.3, 6), "heavy": (40, 380)}
-_FIRST = ["Maya", "Luis", "Priya", "Jordan", "Aiko", "Tomás", "Nia", "Owen", "Farah", "Diego", "Hana", "Sam"]
-_LAST = ["Okafor", "Reyes", "Nakamura", "Patel", "Lindqvist", "Moreau", "Haddad", "Kowalski", "Chen", "Adeyemi"]
+_FIRST = ["Maya", "Luis", "Priya", "Jordan", "Aiko", "Tomás", "Nia", "Owen", "Farah", "Diego", "Hana", "Sam", "Rhys", "Kiri"]
+_LAST = ["Okafor", "Reyes", "Nakamura", "Patel", "Lindqvist", "Moreau", "Haddad", "Kowalski", "Chen", "Adeyemi", "Walker"]
+_ROLES = ("Shift supervisor", "Fleet dispatcher", "Maintenance fitter", "Tyre fitter", "Blast coordinator",
+          "Grade control geologist", "Safety officer")
 
 
-def generator(rng: random.Random, industry: str, city: str) -> dict:
+def generator(rng: random.Random, commodity: str, region: str) -> dict:
     """A complete profile without a model (random but plausible)."""
-    prefix = "".join(rng.choice("ABCDEFGHJKLMNPRSTVWXZ") for _ in range(2))
+    mat, unit, (glo, ghi) = COMMODITIES.get(commodity, COMMODITIES["copper"])
+    prefix = "".join(rng.choice("ABCDEFGHKMNPRSTVW") for _ in range(2))
+    value = {"ore": rng.randint(60, 140), "lowgrade": rng.randint(14, 32), "waste": 0, "sand": rng.randint(8, 16)}
     catalog = []
-    for i, s in enumerate(slot_spec()):
-        adj, nouns = _WORDS[s["cls"]]
-        lo, hi = _VALUE[s["cls"]]
-        wlo, whi = _WEIGHT[s["cls"]]
-        catalog.append({"slot": s["slot"], "sku": f"{prefix}-{rng.randint(10, 99)}{i:03d}",
-                        "name": f"{rng.choice(adj)} {nouns[i % len(nouns)]}", "category": s["cls"].replace("_", " "),
-                        "uom": rng.choice(["each", "box", "case", "pack"]),
-                        "unit_value": round(rng.uniform(lo, hi), 2), "unit_weight": round(rng.uniform(wlo, whi), 2)})
-    company = f"{rng.choice(['Northgate', 'Bluestem', 'Harbor', 'Keystone', 'Summit', 'Ironwood'])} " \
-              f"{rng.choice(['Supply', 'Distribution', 'Logistics', 'Commerce'])}"
+    for s in slot_spec():
+        name, cat = _MATERIAL[s["cls"]]
+        g = rng.uniform(glo, ghi) * (1 if s["cls"] == "ore" else 0.45 if s["cls"] == "lowgrade" else 0.05)
+        catalog.append({"slot": s["slot"], "sku": f"{prefix}-{s['cls'][:2].upper()}{rng.randint(10, 99)}",
+                        "name": name.format(c=mat.capitalize()), "category": cat,
+                        "grade": f"{g:.2f} {unit}" if s["cls"] != "sand" else "0-5 mm, washed",
+                        "unit_value": float(value[s["cls"]]), "unit_weight": float(rng.randint(230, 285))})
+    company = f"{rng.choice(['Red Ridge', 'Ironbark', 'Saltbush', 'Copperhead', 'Granite Peak', 'Mulga'])} " \
+              f"{rng.choice(['Resources', 'Mining', 'Minerals', 'Metals'])}"
+    pit = f"{rng.choice(['Kestrel', 'Blackwood', 'Yarrie', 'Condor', 'Ghost Gum', 'Emu Creek'])} Pit"
     return {
-        "facility": {"company": company, "name": f"{city.split(',')[0]} Fulfilment Center",
-                     "code": f"{city[:3].upper()}-{rng.randint(1, 9)}", "city": city, "sq_ft": rng.randint(180, 900) * 1000,
-                     "description": f"Robotic fulfilment for {industry}.", "shifts": ["Day 06:00-14:30", "Swing 14:30-23:00"]},
+        "facility": {"company": company, "name": pit, "code": f"{region[:3].upper()}-{rng.randint(1, 9)}",
+                     "location": region, "commodity": commodity,
+                     "description": f"Open-pit {commodity} mine run by an autonomous haul fleet.",
+                     "shifts": ["Day 06:00-18:00", "Night 18:00-06:00"]},
         "catalog": catalog,
-        "customers": [{"name": f"{rng.choice(['Apex', 'Cedar', 'Lumen', 'Vista', 'Orion', 'Pioneer'])} "
-                               f"{rng.choice(['Health', 'Retail', 'Labs', 'Industrial', 'Market', 'Systems'])} {i}",
-                       "segment": rng.choice(["retail", "healthcare", "industrial", "e-commerce"]),
-                       "tier": rng.choice(["platinum", "gold", "gold", "standard", "standard", "standard"])}
-                      for i in range(1, 11)],
-        "carriers": [{"dock": d, "carrier": rng.choice(["Coastline Freight", "Redline Parcel", "Meridian LTL"]),
-                      "service": rng.choice(["Ground", "Next day", "LTL"]), "cutoff": f"{rng.randint(14, 18)}:30"}
-                     for d in sorted(W.docks)],
-        "robots": [{"id": r["id"], "model": "Atlas HL-800" if "heavy" in r["caps"] else "Swift AMR-120",
-                    "serial": f"SN{rng.randint(100000, 999999)}", "firmware": f"4.{rng.randint(0, 9)}.{rng.randint(0, 20)}",
-                    "commissioned": f"2025-{rng.randint(1, 12):02d}-{rng.randint(1, 28):02d}",
-                    "payload_kg": 800 if "heavy" in r["caps"] else 120} for r in ROBOT_SPECS],
-        "associates": [{"name": f"{rng.choice(_FIRST)} {rng.choice(_LAST)}", "role": role, "shift": "Day"}
-                       for role in ("Shift lead", "Safety officer", "Inventory control", "Maintenance tech",
-                                    "Fleet engineer", "Dock supervisor")],
-        "cost_model": {"downtime_usd_per_min": rng.randint(40, 160), "collision_usd": rng.randint(2500, 12000),
-                       "mispick_usd": rng.randint(45, 180), "safety_incident_usd": rng.randint(8000, 40000),
-                       "late_order_usd": rng.randint(25, 150)},
+        "excavators": [{"slot": s["slot"], "id": f"EX-0{i + 1}", "model": rng.choice(["HX-390 Face Shovel", "HX-450 Backhoe"]),
+                        "bucket_m3": float(rng.randint(28, 42))} for i, s in enumerate(slot_spec())],
+        "customers": [{"name": f"{rng.choice(['Pacific', 'Northern', 'Coastal', 'Summit', 'Harbour'])} "
+                               f"{rng.choice(['Smelting', 'Steel', 'Metals Trading', 'Concrete'])} {i}",
+                       "segment": rng.choice(["smelter", "steel mill", "trader", "construction"]),
+                       "tier": "platinum" if i == 1 else rng.choice(["gold", "standard"])} for i in range(1, 5)]
+                     + [{"name": "Mine operations (internal)", "segment": "internal", "tier": "standard"}],
+        "carriers": [{"dock": d, "carrier": f"{DOCK_KIND[d].capitalize()} {d.replace('DK', '')}",
+                      "service": DOCK_KIND[d], "cutoff": f"{rng.randint(18, 40) * 100:,} t/h"} for d in sorted(W.docks)],
+        "robots": [{"id": r["id"], "model": "HX-930 Autonomous Haul Truck", "serial": f"SN{rng.randint(100000, 999999)}",
+                    "firmware": f"7.{rng.randint(0, 9)}.{rng.randint(0, 20)}",
+                    "commissioned": f"202{rng.randint(3, 6)}-{rng.randint(1, 12):02d}-{rng.randint(1, 28):02d}",
+                    "payload_t": 290} for r in ROBOT_SPECS + SPARE_SPECS],
+        "associates": [{"name": f"{rng.choice(_FIRST)} {rng.choice(_LAST)}", "role": role, "shift": "Day"} for role in _ROLES],
+        "cost_model": {"downtime_usd_per_min": rng.randint(90, 240), "collision_usd": rng.randint(80_000, 400_000),
+                       "mispick_usd": rng.randint(4_000, 25_000), "safety_incident_usd": rng.randint(50_000, 250_000),
+                       "late_order_usd": rng.randint(800, 4_000)},
     }
 
 
@@ -228,9 +224,8 @@ def validate(raw: dict, fill: dict) -> dict:
     raw = raw if isinstance(raw, dict) else {}
     out: dict[str, Any] = {}
     f, ff = raw.get("facility") or {}, fill["facility"]
-    out["facility"] = {k: _txt(f.get(k), 160, ff[k]) for k in ("company", "name", "code", "city", "description")}
+    out["facility"] = {k: _txt(f.get(k), 160, ff[k]) for k in ("company", "name", "code", "location", "commodity", "description")}
     out["facility"]["code"] = re.sub(r"[^A-Z0-9-]", "", out["facility"]["code"].upper())[:10] or ff["code"]
-    out["facility"]["sq_ft"] = int(_num(f.get("sq_ft"), 50_000, 3_000_000, ff["sq_ft"]))
     shifts = [_txt(s, 60, "") for s in (f.get("shifts") or [])][:4]
     out["facility"]["shifts"] = [s for s in shifts if s] or ff["shifts"]
 
@@ -244,17 +239,23 @@ def validate(raw: dict, fill: dict) -> dict:
             sku = base["sku"]
         seen.add(sku)
         cls = W.slots[base["slot"]]["cls"]
-        lo, hi = _VALUE[cls]
         catalog.append({"slot": base["slot"], "sku": sku, "name": _txt(c.get("name"), 80, base["name"]),
                         "category": _txt(c.get("category"), 40, base["category"]), "cls": cls,
-                        "uom": _txt(c.get("uom"), 12, base["uom"]).lower(),
-                        "unit_value": round(_num(c.get("unit_value"), 0.05, 50_000, base["unit_value"]), 2),
-                        "unit_weight": round(_num(c.get("unit_weight"), 0.001, 2_000, base["unit_weight"]), 2)})
+                        "grade": _txt(c.get("grade"), 40, base["grade"]), "uom": "t",
+                        "unit_value": round(_num(c.get("unit_value"), 0, 5_000, base["unit_value"]), 2) if cls != "waste" else 0.0,
+                        "unit_weight": round(_num(c.get("unit_weight"), 150, 320, base["unit_weight"]), 0)})
     out["catalog"] = catalog
+    exc = {e.get("slot"): e for e in raw.get("excavators") or [] if isinstance(e, dict)}
+    out["excavators"] = [{"slot": b["slot"], "id": _txt(exc.get(b["slot"], {}).get("id"), 12, b["id"]),
+                          "model": _txt(exc.get(b["slot"], {}).get("model"), 40, b["model"]),
+                          "bucket_m3": round(_num(exc.get(b["slot"], {}).get("bucket_m3"), 10, 60, b["bucket_m3"]), 0)}
+                         for b in fill["excavators"]]
 
-    custs = [c for c in raw.get("customers") or [] if isinstance(c, dict) and c.get("name")][:12] or fill["customers"]
-    out["customers"] = [{"id": f"C-{1001 + i}", "name": _txt(c.get("name"), 60, f"Customer {i}"),
-                         "segment": _txt(c.get("segment"), 60, "retail"),
+    custs = [c for c in raw.get("customers") or [] if isinstance(c, dict) and c.get("name")][:8] or fill["customers"]
+    if not any("internal" in str(c.get("segment", "")).lower() or "internal" in str(c.get("name", "")).lower() for c in custs):
+        custs = custs + [{"name": "Mine operations (internal)", "segment": "internal", "tier": "standard"}]
+    out["customers"] = [{"id": f"C-{1001 + i}", "name": _txt(c.get("name"), 60, f"Buyer {i}"),
+                         "segment": _txt(c.get("segment"), 60, "trader"),
                          "tier": c.get("tier") if c.get("tier") in TIERS else "standard"} for i, c in enumerate(custs)]
     for c in out["customers"]:
         c["sla_hours"] = TIERS[c["tier"]]
@@ -262,18 +263,18 @@ def validate(raw: dict, fill: dict) -> dict:
     carriers = {c.get("dock"): c for c in raw.get("carriers") or [] if isinstance(c, dict)}
     out["carriers"] = [{"dock": b["dock"], "carrier": _txt(carriers.get(b["dock"], {}).get("carrier"), 40, b["carrier"]),
                         "service": _txt(carriers.get(b["dock"], {}).get("service"), 30, b["service"]),
-                        "cutoff": _txt(carriers.get(b["dock"], {}).get("cutoff"), 8, b["cutoff"])}
+                        "cutoff": _txt(carriers.get(b["dock"], {}).get("cutoff"), 16, b["cutoff"])}
                        for b in fill["carriers"]]
     robots = {r.get("id"): r for r in raw.get("robots") or [] if isinstance(r, dict)}
     out["robots"] = [{"id": b["id"], **{k: _txt(robots.get(b["id"], {}).get(k), 40, b[k])
                                         for k in ("model", "serial", "firmware", "commissioned")},
-                      "payload_kg": int(_num(robots.get(b["id"], {}).get("payload_kg"), 20, 2000, b["payload_kg"]))}
+                      "payload_t": int(_num(robots.get(b["id"], {}).get("payload_t"), 150, 400, b["payload_t"]))}
                      for b in fill["robots"]]
-    people = [a for a in raw.get("associates") or [] if isinstance(a, dict) and a.get("name")][:8] or fill["associates"]
-    out["associates"] = [{"name": _txt(a.get("name"), 40, "Associate"), "role": _txt(a.get("role"), 40, "Associate"),
+    people = [a for a in raw.get("associates") or [] if isinstance(a, dict) and a.get("name")][:9] or fill["associates"]
+    out["associates"] = [{"name": _txt(a.get("name"), 40, "Crew member"), "role": _txt(a.get("role"), 40, "Operator"),
                           "shift": _txt(a.get("shift"), 30, "Day")} for a in people]
     cm, fc = raw.get("cost_model") or {}, fill["cost_model"]
-    out["cost_model"] = {k: round(_num(cm.get(k), 1, 1_000_000, fc[k]), 2) for k in fc}
+    out["cost_model"] = {k: round(_num(cm.get(k), 1, 5_000_000, fc[k]), 2) for k in fc}
     return out
 
 
@@ -281,21 +282,21 @@ async def generate(settings: Settings, rng: random.Random | None = None,
                    transport: httpx.AsyncBaseTransport | None = None) -> tuple[dict, str, dict]:
     """(profile, source, theme)."""
     rng = rng or random.Random()
-    theme = {"industry": rng.choice(INDUSTRIES), "city": rng.choice(CITIES)}
-    fill = generator(rng, theme["industry"], theme["city"])
+    theme = {"commodity": rng.choice(sorted(COMMODITIES)), "region": rng.choice(REGIONS)}
+    fill = generator(rng, theme["commodity"], theme["region"])
     if settings.inference_enabled:
         try:
-            raw, source = await _ask(settings, prompt(theme["industry"], theme["city"]), transport)
+            raw, source = await _ask(settings, prompt(theme["commodity"], theme["region"]), transport)
             return validate(raw, fill), source, theme
         except (httpx.HTTPError, ValueError, KeyError, IndexError) as exc:
-            log.warning("site profile generation failed, using the generator: %s", exc)
+            log.warning("mine profile generation failed, using the generator: %s", exc)
     return validate(fill, fill), "generator", theme
 
 
 # ---------------------------------------------------------------- persistence
 
 async def ensure_site(pool: asyncpg.Pool, settings: Settings) -> dict:
-    """The site row, creating it (and the catalog and customers) on first boot of a database."""
+    """The site row, creating it (and the materials and buyers) on first boot of a database."""
     async with pool.acquire() as c:
         row = await c.fetchrow("SELECT * FROM site")
     if row is None:
@@ -304,6 +305,7 @@ async def ensure_site(pool: asyncpg.Pool, settings: Settings) -> dict:
             if await c.fetchval("SELECT 1 FROM site") is None:
                 fac = profile["facility"]
                 stored = {**{k: v for k, v in profile.items() if k not in ("catalog", "customers")},
+                          "catalog_grades": [{"slot": x["slot"], "grade": x["grade"]} for x in profile["catalog"]],
                           "theme": theme}
                 await c.execute("INSERT INTO site (code, name, profile, source) VALUES ($1, $2, $3, $4)",
                                 fac["code"], fac["name"], stored, source)
@@ -316,17 +318,9 @@ async def ensure_site(pool: asyncpg.Pool, settings: Settings) -> dict:
                                     [(x["id"], x["name"], x["segment"], x["tier"], x["sla_hours"])
                                      for x in profile["customers"]])
                 await log_event(c, "site.created", {"code": fac["code"], "name": fac["name"], "company": fac["company"],
-                                                    "source": source, **theme, "skus": len(profile["catalog"]),
-                                                    "customers": len(profile["customers"])})
+                                                    "source": source, **theme, "faces": len(profile["catalog"]),
+                                                    "buyers": len(profile["customers"])})
     return await load_site(pool)
-
-
-def gtin13(sku: str) -> str:
-    """A stable GTIN-13 barcode number for an SKU (company prefix 0845211, check digit per GS1)."""
-    import hashlib
-    body = "0845211" + str(int(hashlib.sha256(sku.encode()).hexdigest(), 16) % 100000).zfill(5)
-    total = sum(int(d) * (3 if i % 2 else 1) for i, d in enumerate(body))
-    return body + str((10 - total % 10) % 10)
 
 
 async def load_site(pool: asyncpg.Pool) -> dict:
@@ -334,38 +328,41 @@ async def load_site(pool: asyncpg.Pool) -> dict:
         row = await c.fetchrow("SELECT * FROM site")
         cat = await c.fetch("SELECT * FROM catalog ORDER BY slot")
         custs = await c.fetch("SELECT * FROM customers ORDER BY id")
-    return {"code": row["code"], "name": row["name"], "source": row["source"], **row["profile"],
+    profile = row["profile"]
+    grades = {x["slot"]: x.get("grade", "") for x in profile.get("catalog_grades", [])}
+    site = {"code": row["code"], "name": row["name"], "source": row["source"], **profile,
             "catalog": {r["slot"]: {**dict(r), "unit_value": float(r["unit_value"]), "unit_weight": float(r["unit_weight"]),
-                                    "barcode": gtin13(r["sku"])} for r in cat},
+                                    "grade": grades.get(r["slot"], "")} for r in cat},
             "customers": [dict(r) for r in custs]}
+    return site
 
 
-# ---------------------------------------------------------------- orders
+# ---------------------------------------------------------------- load tickets
 
-_QTY = {"boxed": (1, 6), "loose_small": (2, 24), "fragile": (1, 3), "heavy": (1, 1)}
-_WEIGHT_BY_TIER = {"platinum": 1, "gold": 3, "standard": 6}
+def buyer_for(site: dict, cls: str, rng: random.Random) -> dict:
+    """Who a load is for: an offtake buyer for saleable material, the mine itself for waste."""
+    internal = [c for c in site["customers"] if c["segment"] == "internal" or "internal" in c["name"].lower()]
+    buyers = [c for c in site["customers"] if c not in internal]
+    if cls == "waste" or not buyers:
+        return (internal or site["customers"])[0]
+    return rng.choices(buyers, weights=[{"platinum": 1, "gold": 3, "standard": 6}.get(c["tier"], 3) for c in buyers])[0]
 
 
-def make_order(site: dict, rng: random.Random, seq: int) -> dict:
-    """One order: a weighted customer, 1-2 lines (heavy lines are rare), the carrier at a dock."""
-    custs = site["customers"]
-    cust = rng.choices(custs, weights=[_WEIGHT_BY_TIER.get(c["tier"], 3) for c in custs])[0]
-    pool = [s for s in sorted(site["catalog"]) if not s.startswith("F") or rng.random() < 0.08]
-    slots = rng.sample(pool, rng.choice([1, 1, 1, 2]))
-    lines = []
-    for s in slots:
-        item = site["catalog"][s]
-        lo, hi = _QTY[item["cls"]]
-        qty = rng.randint(lo, hi)
-        lines.append({"slot": s, "sku": item["sku"], "name": item["name"], "qty": qty,
-                      "unit_value": item["unit_value"]})
-    carrier = rng.choice(site["carriers"])
+def make_order(site: dict, rng: random.Random, seq: int, slot: str) -> dict:
+    """One load ticket: a truck load from a dig face to the destination its material goes to."""
+    item = site["catalog"][slot]
+    cls = W.slots[slot]["cls"]
+    dock = DESTINATION[cls]
+    cust = buyer_for(site, cls, rng)
+    dest = next((c for c in site["carriers"] if c["dock"] == dock), {"carrier": dock})
+    tonnes = int(item["unit_weight"]) - rng.randint(0, 12)
     now = dt.datetime.now(dt.timezone.utc)
-    return {"id": f"SO-{seq}", "customer_id": cust["id"], "customer": cust["name"], "tier": cust["tier"],
-            "dock": carrier["dock"], "carrier": carrier["carrier"], "lines": lines,
-            "value": round(sum(x["qty"] * x["unit_value"] for x in lines), 2),
-            "priority": "expedite" if cust["tier"] == "platinum" or rng.random() < 0.1 else "standard",
-            "ship_by": now + dt.timedelta(hours=cust["sla_hours"])}
+    return {"id": f"LD-{seq}", "customer_id": cust["id"], "customer": cust["name"], "tier": cust["tier"],
+            "dock": dock, "carrier": dest["carrier"],
+            "lines": [{"slot": slot, "sku": item["sku"], "name": item["name"], "qty": tonnes, "unit_value": item["unit_value"]}],
+            "value": round(tonnes * item["unit_value"], 2),
+            "priority": "expedite" if cls == "ore" and rng.random() < 0.25 else "standard",
+            "ship_by": now + dt.timedelta(minutes=10)}
 
 
 # ---------------------------------------------------------------- KPIs
@@ -391,22 +388,29 @@ async def kpis(rt: Any) -> dict:
             "count(*) FILTER (WHERE status = 'fixed') AS fixed, "
             "max(created_at) FILTER (WHERE type IN ('collision', 'zone_breach', 'wrong_item')) AS last_safety, "
             "avg(extract(epoch FROM updated_at - created_at)) FILTER (WHERE status = 'fixed') AS mttr_s FROM failures")
+        ai = await c.fetchrow("SELECT count(*) FILTER (WHERE type = 'ai.dispatch') AS dispatch, "
+                              "count(*) FILTER (WHERE type = 'ai.traffic') AS traffic, "
+                              "count(*) FILTER (WHERE type = 'service.step' AND payload->>'by' = 'copilot') AS service "
+                              "FROM events WHERE type IN ('ai.dispatch', 'ai.traffic', 'service.step') "
+                              "AND ts > now() - interval '1 hour'")
     frame = rt.frame or {"robots": []}
-    busy = sum(1 for r in frame["robots"] if r.get("st") not in ("idle", None))
+    trucks = [r for r in frame["robots"] if r.get("st") != "standby"]
+    busy = sum(1 for r in trucks if r.get("st") not in ("idle", "fault", None))
     return {"orders": o["orders"], "shipped": o["shipped"], "open": o["open"], "problems": o["problems"],
             "value_shipped": float(o["value_shipped"]), "units_shipped": int(o["units_shipped"]),
-            "orders_per_hour": o["shipped_15m"] * 4,
+            "orders_per_hour": o["shipped_15m"] * 4, "tonnes_per_hour": 0,
             "on_time_pct": round(100 * j["on_time"] / j["done"], 1) if j["done"] else None,
             "incidents_open": f["open"], "incidents_fixed": f["fixed"],
             "mttr_s": round(f["mttr_s"]) if f["mttr_s"] else None,
-            "last_safety_incident": f["last_safety"], "fleet_busy": busy, "fleet_size": len(frame["robots"]),
+            "last_safety_incident": f["last_safety"], "fleet_busy": busy, "fleet_size": len(trucks),
+            "ai_decisions_hour": int(ai["dispatch"] + ai["traffic"] + ai["service"]),
             "docks": {r["dock"]: {"orders": r["orders"], "units": int(r["units"])} for r in docks}}
 
 
 # ---------------------------------------------------------------- incident impact
 
 async def failure_order(c: asyncpg.Connection, f: Any) -> asyncpg.Record | None:
-    """The customer order the failing robot was working on, if any."""
+    """The load ticket the failing truck was working on, if any."""
     job = (f["detail"] or {}).get("job")
     if job is None:
         job = await c.fetchval("SELECT id FROM jobs WHERE robot_id = $1 AND run_id = $2 AND assigned_tick <= $3 "
@@ -418,37 +422,38 @@ async def failure_order(c: asyncpg.Connection, f: Any) -> asyncpg.Record | None:
 
 
 async def business_context(c: asyncpg.Connection, site: dict | None, f: Any) -> dict | None:
-    """What the incident means for the business, for the investigator to weigh against throughput cost."""
+    """What the incident means for the mine, for the investigator to weigh against throughput cost."""
     if not site:
         return None
     order = await failure_order(c, f)
     shipped = await c.fetchval("SELECT count(*) FROM orders WHERE status = 'shipped' "
                                "AND shipped_at > now() - interval '30 minutes'")
     imp = impact(site, f["type"], order)
-    return {"site": f"{site['facility']['company']} · {site['name']} ({site['code']})",
-            "order": ({"id": order["id"], "customer": order["customer"], "tier": order["tier"],
-                       "value_usd": float(order["value"]), "priority": order["priority"],
-                       "lines": [f"{x['qty']} × {x['name']} ({x['sku']})" for x in order["lines"]]} if order else None),
+    fac = site["facility"]
+    return {"site": f"{fac['company']} · {site['name']} ({site['code']}), {fac.get('commodity', '')}",
+            "load": ({"id": order["id"], "for": order["customer"], "value_usd": float(order["value"]),
+                      "priority": order["priority"], "destination": order["carrier"],
+                      "material": [f"{x['qty']} t {x['name']} ({x['sku']})" for x in order["lines"]]} if order else None),
             "estimated_incident_cost_usd": imp["estimated_cost_usd"], "cost_basis": imp["basis"],
-            "orders_shipped_per_hour": shipped * 2,
-            "downtime_usd_per_min": site["cost_model"]["downtime_usd_per_min"]}
+            "loads_dumped_per_hour": shipped * 2,
+            "downtime_usd_per_truck_minute": site["cost_model"]["downtime_usd_per_min"]}
 
 
 def impact(site: dict, failure_type: str, order: dict | None) -> dict:
-    """Estimated cost of one incident from the site's cost model (labelled as an estimate in the UI)."""
+    """Estimated cost of one incident from the mine's cost model (labelled as an estimate in the UI)."""
     cm = site["cost_model"]
-    base = {"collision": cm["collision_usd"] + 5 * cm["downtime_usd_per_min"],
+    base = {"collision": cm["collision_usd"] + 20 * cm["downtime_usd_per_min"],
             "wrong_item": cm["mispick_usd"] + (float(order["value"]) if order else 0.0),
             "zone_breach": cm["safety_incident_usd"],
-            "task_overdue": cm["late_order_usd"] + 2 * cm["downtime_usd_per_min"],
-            "stall": 3 * cm["downtime_usd_per_min"]}.get(failure_type, cm["downtime_usd_per_min"])
-    why = {"collision": "repair + 5 min of downtime", "wrong_item": "mispick handling + reshipping the order",
-           "zone_breach": "recordable safety incident", "task_overdue": "late-order penalty + 2 min downtime",
-           "stall": "3 min of downtime"}.get(failure_type, "downtime")
+            "task_overdue": cm["late_order_usd"] + 5 * cm["downtime_usd_per_min"],
+            "stall": 5 * cm["downtime_usd_per_min"]}.get(failure_type, cm["downtime_usd_per_min"])
+    why = {"collision": "truck repair + 20 min of downtime", "wrong_item": "misrouted load: rehandling + the load's value",
+           "zone_breach": "recordable safety incident (blast exclusion zone)", "task_overdue": "late load + 5 min downtime",
+           "stall": "5 min of downtime"}.get(failure_type, "downtime")
     return {"estimated_cost_usd": round(base, 2), "basis": why,
             "order": ({k: order[k] for k in ("id", "customer_id", "value", "priority", "status", "carrier", "dock")}
                       | {"value": float(order["value"])}) if order else None}
 
 
-__all__ = ["CLASS_HINT", "ITEM_CLASSES", "SCHEMA", "business_context", "ensure_site", "failure_order", "generate",
-           "generator", "impact", "kpis", "load_site", "make_order", "prompt", "validate"]
+__all__ = ["CLASS_HINT", "ITEM_CLASSES", "SCHEMA", "business_context", "buyer_for", "ensure_site", "failure_order",
+           "generate", "generator", "impact", "kpis", "load_site", "make_order", "prompt", "validate"]

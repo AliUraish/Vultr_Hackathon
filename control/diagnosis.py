@@ -2,11 +2,10 @@
 
 Two engines, same contract:
   - playbook (default, free): rules per failure type that read the capsule's
-    evidence (speed, zone, the chaos input, the bin involved) and fill in the
+    evidence (speed, bench, the hazard input, the dig face involved) and fill in the
     parameters of the matching DSL fixes.
-  - an LLM (only if INFERENCE_KEY is set): OpenAI, or Vultr Serverless
-    Inference, or any OpenAI-compatible endpoint. It must answer in strict JSON;
-    answers are validated against the DSL and retried once with the errors.
+  - Vultr Serverless Inference (when INFERENCE_KEY is set). It must answer in strict
+    JSON; answers are validated against the DSL and retried once with the errors.
 Either way nothing is trusted until forked replays prove it.
 """
 from __future__ import annotations
@@ -18,20 +17,21 @@ from typing import Any
 
 import httpx
 
-from replay_core.policy import FIX_TYPES, JOB_KINDS, STRATEGIES, PolicyError, parse_rule
+from replay_core.policy import FIX_TYPES, PolicyError, parse_rule
 from replay_core.world import ACCEL, CELL, ITEM_CLASSES, SENSOR_RANGE, TICK_HZ, W
 
 from .config import Settings
+from .usage import USAGE
 
 log = logging.getLogger("replay.diagnosis")
 
 MAX_HYPOTHESES = 3
 _KEEP = ("robot", "with", "v", "cell", "slot", "sku", "expected", "actual", "ok", "job", "zone",
-         "dock", "reason", "id", "type", "scenario", "until", "version")
+         "dock", "reason", "id", "type", "scenario", "until", "version", "depth")
 
 
-def _mps(v_mm_per_tick: int) -> float:
-    return v_mm_per_tick * TICK_HZ / 1000
+def _kmh(v_mm_per_tick: int) -> float:
+    return round(v_mm_per_tick * TICK_HZ * 3.6 / 1000, 1)
 
 
 def _stopping_m(v_mm_per_tick: int) -> float:
@@ -50,23 +50,23 @@ def context(capsule: dict, failure: dict, events: list[dict], policy_rules: list
     robot = next(r for r in at["robots"] if r["id"] == target["robot"])
     cell = [robot["x"] // CELL, robot["y"] // CELL]
     recent = [f for f in frames if target["tick"] - 30 <= f["t"] <= target["tick"]]
-    speeds = [_mps(next(r["v"] for r in f["robots"] if r["id"] == target["robot"])) for f in recent]
+    speeds = [_kmh(next(r["v"] for r in f["robots"] if r["id"] == target["robot"])) for f in recent]
     world_events = [
         {"tick": t, **{k: v for k, v in i.items() if k in ("type", "scenario", "cell", "slot", "sku", "zone", "ticks")},
-         **({"slot_item_class": W.slots[i["slot"]]["cls"]} if i.get("slot") in W.slots else {}),
-         **({"appeared_m_ahead_of_robot": round(i["gap_mm"] / 1000, 2), "robot": i.get("target"),
-             "robot_speed_mps": _mps(i.get("v", 0))} if isinstance(i.get("gap_mm"), int) else {})}
+         **({"face_material": W.slots[i["slot"]]["cls"]} if i.get("slot") in W.slots else {}),
+         **({"appeared_m_ahead_of_truck": round(i["gap_mm"] / 1000, 1), "truck": i.get("target"),
+             "truck_speed_kmh": _kmh(i.get("v", 0))} if isinstance(i.get("gap_mm"), int) else {})}
         for t, ins in capsule["inputs"] for i in ins if i.get("kind") == "chaos"
     ]
     return {
-        "failure": {"type": target["type"], "robot": target["robot"], "tick": target["tick"],
+        "failure": {"type": target["type"], "truck": target["robot"], "robot": target["robot"], "tick": target["tick"],
                     "detail": failure.get("detail", {})},
         "robot_at_failure": {
             "cell": f"c{cell[0]}_{cell[1]}", "zones": list(W.cell_zones.get((cell[0], cell[1]), ())),
-            "speed_mps": _mps(robot["v"]), "status": robot["st"], "job": robot["job"],
+            "speed_kmh": _kmh(robot["v"]), "status": robot["st"], "load_ticket": robot["job"],
             "carrying": robot["carry"],
         },
-        "max_speed_last_3s_mps": max(speeds) if speeds else 0.0,
+        "max_speed_last_3s_kmh": max(speeds) if speeds else 0.0,
         "world_events_in_capsule": world_events,
         "failures_in_capsule": [{k: f[k] for k in ("type", "robot", "tick")} for f in capsule["baseline_failures"]],
         "recent_events": [
@@ -82,9 +82,9 @@ def context(capsule: dict, failure: dict, events: list[dict], policy_rules: list
 # ---------------------------------------------------------------- playbook
 
 def _cap_zone(zones: list[str]) -> str | None:
-    if "racks" in zones:
-        return "racks"
-    return next((z for z in zones if z.startswith("aisle_")), zones[0] if zones else None)
+    if "benches" in zones:
+        return "benches"
+    return next((z for z in zones if z.startswith("bench_") or z.startswith("ramp")), zones[0] if zones else None)
 
 
 def playbook(ctx: dict) -> list[dict]:
@@ -95,94 +95,88 @@ def playbook(ctx: dict) -> list[dict]:
     out: list[tuple[str, str, str]] = []
 
     if typ == "collision":
-        v = max(ctx["max_speed_last_3s_mps"], r["speed_mps"])
-        v_tick = int(v * 1000 / TICK_HZ)
+        v = max(ctx["max_speed_last_3s_kmh"], r["speed_kmh"])
+        v_tick = int(v * 1000 / 3.6 / TICK_HZ)
         zone = _cap_zone(zones)
-        pallet = next((e["cell"] for e in chaos if e.get("type") == "spawn_pallet"), None)
+        rock = next((e["cell"] for e in chaos if e.get("type") == "spawn_rock"), None)
         if zone:
             out.append((
-                f"{rid} was doing {v:.1f} m/s in {zone}. At that speed it needs {_stopping_m(v_tick):.2f} m to "
-                f"stop but senses only {SENSOR_RANGE / 1000:.1f} m ahead, so it could not brake for an obstacle "
-                "that appeared close in front of it.",
-                f"speed_cap({zone}, 0.5)",
-                "Slow robots where obstacles can appear suddenly; at 0.5 m/s the stopping distance is about 0.1 m.",
+                f"{rid} was doing {v:.0f} km/h on {zone}. At that speed a haul truck needs {_stopping_m(v_tick):.0f} m "
+                f"to stop, and the rock came off the highwall closer than that, so no amount of braking could avoid it.",
+                f"speed_cap({zone}, 20)",
+                "Slow trucks where rocks can fall onto the road; at 20 km/h the stopping distance is about 8 m.",
             ))
         out.append((
-            f"{rid} keeps too little distance to obstacles it has already sensed.",
-            "min_clearance(0.4)",
+            f"{rid} keeps too little distance to obstacles its lidar has already seen.",
+            "min_clearance(6)",
             "Brake earlier for sensed obstacles.",
         ))
-        if pallet:
+        if rock:
             out.append((
-                f"Traffic is routed through c{pallet[0]}_{pallet[1]}, where the pallet fell.",
-                f"reroute_avoid(c{pallet[0]}_{pallet[1]})",
-                "Keep robots out of that cell.",
+                f"Trucks are routed through c{rock[0]}_{rock[1]}, where the rock fell.",
+                f"reroute_avoid(c{rock[0]}_{rock[1]})",
+                "Keep trucks off that road segment.",
             ))
     elif typ == "wrong_item":
         slot = next((e["slot"] for e in chaos if e.get("type") == "mislabel"), None)
         if slot is None:
             missing = sorted(set(detail.get("expected", [])) - set(detail.get("actual", [])))
-            slot = missing[0].removeprefix("SKU-") if missing else None
+            slot = missing[0].removeprefix("MAT-") if missing else None
         cls = W.slots[slot]["cls"] if slot in W.slots else None
         if cls:
             out.append((
-                f"Bin {slot} held the wrong item and {rid} picked it without checking: {cls} items are "
-                "picked without a scan, so a mislabeled bin goes unnoticed until the dock.",
-                f"require_scan_confirm({cls})",
-                f"Scan {cls} bins before picking; a mismatch becomes an exception for a person.",
+                f"Face {slot}'s grade tag was wrong and {rid} loaded without a grade check: {cls} faces are loaded on "
+                "the block model alone, so a mixed-up dig block goes unnoticed until the dump.",
+                f"grade_check({cls})",
+                f"Check the grade at {cls} faces before loading; a mismatch becomes an exception for grade control.",
             ))
         out.append((
-            "Any bin can be mislabeled; robots never confirm what they pick.",
-            "require_scan_confirm(*)",
-            "Scan every pick. Safest, but slower.",
+            "Any dig block can be mis-tagged; trucks never confirm what they load.",
+            "grade_check(*)",
+            "Check every load. Safest, but slower at every face.",
         ))
         out.append((
-            "The pick order sent the robot to a neighbouring look-alike bin.",
-            "reorder_steps(*, nearest_first)",
-            "Pick in nearest-first order.",
+            f"{rid} was driving too fast on the benches to notice the change.",
+            "speed_cap(benches, 20)",
+            "Slow down on the benches.",
         ))
     elif typ == "zone_breach":
         zone = detail.get("zone")
         if zone:
             out.append((
-                f"{rid} was already routed through {zone} when a worker closed it, and robots do not "
-                "re-check an existing route when an aisle closes.",
-                f"respect_closures({zone if not zone.startswith('aisle_') else 'racks'})",
-                "Re-plan when an aisle closes and wait outside it; covers robots passing through and "
-                "robots whose pick is inside.",
+                f"{rid} was already routed through {zone} when the blast crew closed it, and trucks do not "
+                "re-check an existing route when a road closes.",
+                f"respect_closures({'benches' if zone.startswith('bench_') else zone})",
+                "Re-plan when a road closes for blasting and wait outside it; covers trucks passing through and "
+                "trucks whose dig face is inside.",
             ))
             out.append((
-                f"{rid}'s route went through {zone}; keeping traffic out of it avoids the conflict.",
+                f"{rid}'s route went through {zone}; keeping traffic off it avoids the conflict.",
                 f"reroute_avoid({zone})",
-                f"Route around {zone} whenever there is another way (does not help robots picking in it).",
+                f"Route around {zone} whenever there is another way (does not help trucks loading on it).",
             ))
             out.append((
-                f"{rid} entered {zone} too fast to stop at the boundary.",
-                f"speed_cap({zone}, 0.3)",
-                "Enter that aisle slowly.",
+                f"{rid} entered {zone} too fast to stop at the barricade.",
+                f"speed_cap({zone}, 15)",
+                "Enter that bench slowly.",
             ))
         out.append((
-            f"{rid} took a path through the rack aisles instead of the main floor.",
-            "reroute_avoid(racks)",
-            "Prefer the open floor to rack aisles.",
+            f"{rid} took a bench road instead of the main haul roads.",
+            "reroute_avoid(benches)",
+            "Prefer the two-lane haul roads to the one-lane benches.",
         ))
     elif typ in ("stall", "task_overdue"):
-        zone = next((z for z in zones if z.startswith("aisle_")), None)
+        zone = next((z for z in zones if z.startswith("bench_") or z == "cuts"), None)
         if zone:
             out.append((
-                f"{rid} got stuck in {zone}, a one-robot-wide aisle where robots block each other.",
+                f"{rid} got stuck on {zone}, a one-lane road where trucks block each other.",
                 f"reroute_avoid({zone})",
-                f"Keep through-traffic out of {zone}.",
+                f"Keep through-traffic off {zone}.",
             ))
         out.append((
             f"{rid} got stuck at {r['cell']}.",
             f"reroute_avoid({r['cell']})",
-            "Route around that cell.",
-        ))
-        out.append((
-            "Multi-pick jobs send robots back and forth through busy aisles.",
-            "reorder_steps(multi, nearest_first)",
-            "Pick the nearest line first.",
+            "Route around that segment.",
         ))
 
     hyps, _ = validate({"hypotheses": [{"cause": c, "fix": x, "rationale": why} for c, x, why in out]},
@@ -228,27 +222,25 @@ def parse_json(text: str) -> Any:
     return json.loads(text[start:end + 1])
 
 
-# ---------------------------------------------------------------- LLM (OpenAI-compatible)
+# ---------------------------------------------------------------- LLM (Vultr Serverless Inference)
 
-SYSTEM_PROMPT = f"""You diagnose warehouse robot fleet failures from a deterministic replay capsule.
-Propose exactly {MAX_HYPOTHESES} distinct hypotheses for the root cause, most likely first; each will be
-tested in its own forked replay, so make them genuinely different. Each hypothesis carries exactly
-one fix, written as one rule in this DSL and nothing else:
-  speed_cap(<zone>, <m/s 0.1-1.2>)
-  min_clearance(<metres 0.05-1.0>)
+SYSTEM_PROMPT = f"""You diagnose failures of an autonomous haul truck fleet in an open-pit mine from a deterministic
+replay capsule. Propose exactly {MAX_HYPOTHESES} distinct hypotheses for the root cause, most likely first; each will be
+tested in its own forked replay, so make them genuinely different. Each hypothesis carries exactly one fix, written as
+one rule in this DSL and nothing else:
+  speed_cap(<zone>, <km/h 5-45>)
+  min_clearance(<metres 1-40>)
   reroute_avoid(<zone> | c<x>_<y>)
-  reorder_steps(<{'|'.join(JOB_KINDS)}>, <{'|'.join(STRATEGIES)}>)
-  require_scan_confirm(<item class> | *)
-  respect_closures(<zone> | *)   robots re-plan when a zone closes and never drive into a closed zone
-Zones: {', '.join(sorted(W.zones))}. "racks" is every rack aisle; aisle_<row><W|E> is one aisle.
-Item classes: {', '.join(ITEM_CLASSES)}. Racks A-B hold boxed, C-D loose_small, E fragile, F heavy
-items; a slot id is rack letter + number (e.g. D8).
-Rank first the fix that would also prevent similar failures elsewhere at the least cost to throughput:
-the widest zone where the same hazard exists over one aisle or cell (a pallet can fall into any rack
-aisle, so "racks" beats a single aisle), a targeted item class over *, unless the evidence says otherwise.
-A speed cap only prevents a collision with a suddenly appearing obstacle if the robot can stop within the
-distance at which it appeared: stopping distance is about v^2 / 2 m at 1 m/s^2 plus 0.1 s of travel.
-Robots move up to 1.2 m/s, brake at 1 m/s^2 and sense obstacles {SENSOR_RANGE / 1000} m ahead.
+  grade_check(<material> | *)      check the material grade at the face before loading
+  respect_closures(<zone> | *)     trucks re-plan when a road closes for blasting and never drive into a closed road
+Zones: {', '.join(sorted(W.zones))}. "benches" is every one-lane bench road and cut under a highwall;
+bench_<upper|lower>_<w|e> is one bench road. Materials: {', '.join(ITEM_CLASSES)} (faces A ore, B lowgrade, C waste, D sand).
+Rank first the fix that would also prevent similar failures elsewhere at the least cost to production:
+the widest zone where the same hazard exists over one bench or segment (a rock can come off any highwall,
+so "benches" beats a single bench), a targeted material over *, unless the evidence says otherwise.
+A speed cap only prevents a collision with a suddenly fallen rock if the truck can stop within the distance at
+which it appeared: stopping distance is about v^2 / 4 m at 2 m/s^2 (v in m/s) plus 0.1 s of travel.
+Haul trucks drive up to 43 km/h empty and 32 km/h loaded, brake at 2 m/s^2 and see {SENSOR_RANGE / 1000:.0f} m ahead with lidar.
 Do not repeat a rule that is already in current_policy. Ground every cause in the capsule evidence.
 Answer with only this JSON, no prose:
 {{"hypotheses": [{{"cause": "...", "fix": "<one DSL rule>", "rationale": "..."}}]}}"""
@@ -258,27 +250,30 @@ class InferenceError(RuntimeError):
     pass
 
 
-# Small, cheap chat models that follow a JSON schema well, in order of preference.
-OPENAI_PREFERRED = ("gpt-4.1-mini", "gpt-4o-mini", "gpt-5-mini", "gpt-4.1", "gpt-4o")
 _NOT_CHAT = ("embed", "whisper", "tts", "audio", "realtime", "transcribe", "image", "dall-e", "moderation",
              "search", "babbage", "davinci")
 
 
 
 
+_MODELS: dict[str, str] = {}   # picked once per endpoint: /models is not free to call on every request
+
+
 async def _pick_model(http: httpx.AsyncClient, settings: Settings) -> str:
     if settings.inference_model:
         return settings.inference_model
+    key = f"{settings.inference_provider}:{settings.inference_url}"
+    if key in _MODELS:
+        return _MODELS[key]
+    _MODELS[key] = await _choose_model(http, settings)
+    return _MODELS[key]
+
+
+async def _choose_model(http: httpx.AsyncClient, settings: Settings) -> str:
     r = await http.get(f"{settings.inference_url}/models")
     r.raise_for_status()
     ids = [m["id"] for m in r.json().get("data", [])]
     chat = [i for i in ids if not any(x in i.lower() for x in _NOT_CHAT)]
-    if settings.inference_provider == "openai":
-        for pref in OPENAI_PREFERRED:
-            if pref in chat:
-                return pref
-        # OpenAI's "-instruct" models are completions-only; elsewhere "-instruct" means a chat model.
-        chat = [i for i in chat if i.startswith("gpt-") and "-instruct" not in i] or chat
     for pref in ("instruct", "llama", "qwen", "mistral"):
         match = next((i for i in chat if pref in i.lower()), None)
         if match:
@@ -289,16 +284,8 @@ async def _pick_model(http: httpx.AsyncClient, settings: Settings) -> str:
 
 
 def _request(settings: Settings, model: str, messages: list[dict]) -> dict:
-    body: dict[str, Any] = {"model": model, "messages": messages}
-    if settings.inference_provider == "openai":
-        # Works for every current OpenAI chat model, reasoning ones included (they reject
-        # max_tokens and any non-default temperature). The budget covers hidden reasoning tokens.
-        body["max_completion_tokens"] = 4000
-        body["response_format"] = {"type": "json_object"}
-    else:
-        body["temperature"] = 0.2
-        body["max_tokens"] = 900
-    return body
+    return {"model": model, "messages": messages, "temperature": 0.2, "max_tokens": 900,
+            "response_format": {"type": "json_object"}}
 
 
 def _adapt(body: dict, error: str) -> bool:
@@ -332,7 +319,10 @@ async def _llm(ctx: dict, settings: Settings,
                 r = await http.post(f"{settings.inference_url}/chat/completions", json=body)
             if r.status_code >= 400:
                 raise InferenceError(f"inference HTTP {r.status_code}: {r.text[:200]}")
-            answer = r.json()["choices"][0]["message"]["content"] or ""
+            data = r.json()
+            u = data.get("usage") or {}
+            USAGE.record("diagnosis", int(u.get("prompt_tokens") or 0), int(u.get("completion_tokens") or 0))
+            answer = data["choices"][0]["message"]["content"] or ""
             try:
                 hyps, errors = validate(parse_json(answer), ctx["current_policy"])
             except (ValueError, json.JSONDecodeError) as exc:

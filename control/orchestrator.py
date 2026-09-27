@@ -32,6 +32,8 @@ log = logging.getLogger("replay.orchestrator")
 TERMINAL = ("fixed", "no_fix", "not_reproducible", "dismissed", "lost")
 SUITE_SIZE = 10
 STUCK_SECONDS = 120
+MAX_DIAGNOSING = 2          # investigations at once: each runs hundreds of sims on VM B's workers
+CONGESTION = ("stall", "task_overdue")
 
 
 class WorkflowError(ValueError):
@@ -47,16 +49,16 @@ def _robustness(h: asyncpg.Record | dict) -> dict:
             "stress_experiment": ev.get("experiment")}
 
 
-CAUSES = {"collision": "pallet_drop", "wrong_item": "mislabel_bin", "zone_breach": "worker_in_aisle"}
+CAUSES = {"collision": "rockfall", "wrong_item": "grade_mixup", "zone_breach": "blast_closure"}
 
 
 async def original_chaos(c: asyncpg.Connection, run_id: str, fail_type: str, fail_tick: int,
                          capsule_inputs: list | None) -> dict | None:
     """The canned-scenario input behind a failure: from the capsule, else the event log (the cause
-    can predate the capsule window, e.g. a bin mislabeled long before the wrong item reached a dock)."""
+    can predate the capsule window, e.g. a grade tag changed long before the wrong load reached a dump)."""
     want = CAUSES.get(fail_type)
     chaos = [i for _, ins in (capsule_inputs or []) for i in ins
-             if i.get("kind") == "chaos" and i.get("scenario") not in (None, "clear_floor")]
+             if i.get("kind") == "chaos" and i.get("scenario") not in (None, "clear_roads")]
     match = next((i for i in reversed(chaos) if i.get("scenario") == want), None)
     if match:
         return match
@@ -126,8 +128,10 @@ class Orchestrator:
         async with self.rt.pool.acquire() as c:
             await c.execute("UPDATE replays SET status = 'queued', worker = NULL, started_at = NULL "
                             f"WHERE status = 'running' AND started_at < now() - interval '{STUCK_SECONDS} seconds'")
+            # hazards (collisions, wrong loads, closures) before congestion (stalls, late loads), oldest first
             ids = [r["id"] for r in await c.fetch(
-                "SELECT id FROM failures WHERE status <> ALL($1::text[]) ORDER BY id", list(TERMINAL))]
+                "SELECT id FROM failures WHERE status <> ALL($1::text[]) ORDER BY (type = ANY($2::text[])), id",
+                list(TERMINAL), list(CONGESTION))]
         for fid in ids:
             try:
                 await self.advance(fid)
@@ -142,14 +146,38 @@ class Orchestrator:
             return
         st = f["status"]
         if st == "open":
+            async with self.rt.pool.acquire() as c:
+                dup = await c.fetchval("SELECT id FROM failures WHERE type = $1 AND robot_id = $2 AND id < $3 "
+                                       "AND status <> ALL($4::text[]) ORDER BY id LIMIT 1",
+                                       f["type"], f["robot_id"], fid, list(TERMINAL))
+                if dup is not None:     # the same failure of the same truck is already being worked
+                    await self._status(c, f, "dismissed", f"duplicate of incident #{dup}")
+                    return
+            if await self._congestion_busy(f):
+                return
             await self._cut(f)
         elif st == "reproducing":
             await self._check_reproduced(f)
         elif st == "diagnosing":
-            if fid not in self._diagnosing:  # e.g. after a restart
+            if fid not in self._diagnosing and not await self._congestion_busy(f) \
+                    and len(self._diagnosing) < MAX_DIAGNOSING:  # queued, or after a restart
                 self._start_diagnosis(fid)
         elif st in ("trials", "awaiting_approval"):
             await self._evaluate(f)
+
+    async def _congestion_busy(self, f: asyncpg.Record) -> bool:
+        """Stalls and late loads are traffic, handled live by the dispatch and traffic AIs: investigate one at a
+        time and close the rest, so the investigation slots stay free for hazards (collisions, wrong loads...)."""
+        if f["type"] not in CONGESTION:
+            return False
+        async with self.rt.pool.acquire() as c:
+            other = await c.fetchval("SELECT id FROM failures WHERE type = ANY($1::text[]) AND id < $2 "
+                                     "AND status <> ALL($3::text[]) ORDER BY id LIMIT 1", list(CONGESTION), f["id"], list(TERMINAL))
+            if other is None:
+                return False
+            await self._status(c, f, "dismissed", f"congestion: incident #{other} is already being investigated; "
+                                                  "the dispatch and traffic AIs are handling the traffic live")
+        return True
 
     # ------------------------------------------------------------ 1. capsule cut
 

@@ -12,9 +12,9 @@ Every call carries a `why` and is written to investigation_steps with its result
 person reviews is exactly what the agent did. The agent never touches the live fleet: its fixes
 become hypotheses that still need the exact-incident trial, the regression suite and a human.
 
-Drivers: OpenAI tool calling (any OpenAI-compatible endpoint, INFERENCE_*), or a scripted
-investigator that follows the same method with the playbook's candidates when there is no key
-or the model fails.
+Drivers: Vultr Serverless Inference tool calling (Chat Completions with function tools), or a
+scripted investigator that follows the same method with the playbook's candidates when there is
+no key or the model fails.
 """
 from __future__ import annotations
 
@@ -34,6 +34,7 @@ from .config import Settings
 from .db import log_event
 from .diagnosis import InferenceError, _pick_model
 from .lab import MIN_ROBUSTNESS
+from .usage import USAGE
 
 log = logging.getLogger("replay.investigator")
 
@@ -86,12 +87,12 @@ TOOLS = [
                        "One simulation; use it to test a hypothesis about the cause.",
         "parameters": {"type": "object", "properties": {
             "rules": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 3,
-                      "description": "DSL rules, e.g. [\"speed_cap(racks, 0.6)\"]"},
+                      "description": "DSL rules, e.g. [\"speed_cap(benches, 20)\"]"},
             "why": _why()}, "required": ["rules", "why"]}}},
     {"type": "function", "function": {
         "name": "stress_test",
         "description": "Test one fix against N variants of the incident (the hazard at other gaps, times, "
-                       "aisles, robots; new pick timings) versus today's policy. Returns robustness (share of "
+                       "bench roads, trucks; new load timings) versus today's policy. Returns robustness (share of "
                        "variants that stay safe), how many failures it prevents or introduces, and the "
                        f"throughput cost. A fix needs robustness >= {MIN_ROBUSTNESS} to pass the gate.",
         "parameters": {"type": "object", "properties": {
@@ -103,7 +104,7 @@ TOOLS = [
         "description": "Stress-test one numeric fix (speed_cap or min_clearance) at a range of settings and "
                        "return the safety/throughput curve and the cheapest setting that passes the gate.",
         "parameters": {"type": "object", "properties": {
-            "fix": {"type": "string", "description": "The fix at any setting, e.g. speed_cap(racks, 0.6)"},
+            "fix": {"type": "string", "description": "The fix at any setting, e.g. speed_cap(benches, 20)"},
             "values": {"type": "array", "items": {"type": "number"}, "maxItems": 10,
                        "description": "Settings to try (optional; sensible defaults otherwise)"},
             "why": _why()}, "required": ["fix", "why"]}}},
@@ -122,16 +123,16 @@ TOOLS = [
             "required": ["root_cause", "evidence", "fixes", "confidence"]}}},
 ]
 
-SYSTEM_PROMPT = f"""You are the incident investigator for a warehouse robot fleet. A failure was recorded as a
-deterministic capsule (full state + every input). You investigate it only through simulation tools; you
-never touch the live fleet. Work like a careful reliability engineer, and be efficient:
+SYSTEM_PROMPT = f"""You are the incident investigator for an autonomous haul truck fleet in an open-pit mine. A
+failure was recorded as a deterministic capsule (full state + every input). You investigate it only through
+simulation tools; you never touch the live fleet. Work like a careful mine reliability engineer, and be efficient:
 
 1. reproduce: confirm the failure replays deterministically (identical hashes, matches live).
 2. isolate_cause: find which recorded events actually cause it.
 3. Form a hypothesis about the mechanism. Use what_if (1 simulation) to test counterfactuals on the
-   exact incident, e.g. "would a lower speed have let it stop?".
+   exact incident, e.g. "would 20 km/h on the benches have let the truck stop?".
 4. stress_test candidate fixes on variants of the incident; a fix that only fixes this one
-   incident is not good enough. Compare robustness AND throughput cost.
+   incident is not good enough. Compare robustness AND production cost.
 5. tune_fix a numeric fix to find the cheapest setting that keeps >= {MIN_ROBUSTNESS:.0%} of variants safe.
 6. submit_findings: root cause, evidence (cite the numbers), up to {MAX_FIXES} fixes ranked best first,
    and the fixes you rejected with the reason.
@@ -143,21 +144,20 @@ it runs now (it may have changed since). Do not propose a rule that is already i
 current_policy already contains what fixes this incident, check it with what_if and say so.
 
 Fixes are single rules in this DSL:
-  speed_cap(<zone>, <m/s 0.1-1.2>)        max speed in a zone
-  min_clearance(<m 0.05-1.0>)             distance kept to obstacles already sensed
-  reroute_avoid(<zone> | c<x>_<y>)        planner avoids these cells when it can
-  reorder_steps(<single|multi|*>, <nearest_first|farthest_first|as_given>)
-  require_scan_confirm(<item class> | *)  scan the bin before picking; a mismatch becomes an exception
-  respect_closures(<zone> | *)            re-plan when a zone closes; never drive into a closed zone
-Zones: {', '.join(sorted(W.zones))}. "racks" = every rack aisle. Item classes: boxed (racks A-B),
-loose_small (C-D), fragile (E), heavy (F).
-Physics: robots drive up to 1.2 m/s, brake at 1 m/s^2 (stopping distance ~ v^2/2 m) and sense
-{SENSOR_RANGE / 1000} m ahead. A pallet that falls closer than the stopping distance cannot be avoided
-by braking; clearance rules only act on obstacles already sensed.
-Prefer the fix that generalises (the widest zone where the same hazard exists, a targeted item
-class over *) at the lowest throughput cost. If `business` is given, put the trade-off in money:
-the estimated cost of one such incident vs what a fix's throughput cost means in orders per hour, and
-say it in the findings. Always call a tool; finish with submit_findings."""
+  speed_cap(<zone>, <km/h 5-45>)          max speed in a zone
+  min_clearance(<m 1-40>)                 distance kept to obstacles the lidar has already seen
+  reroute_avoid(<zone> | c<x>_<y>)        the planner avoids these road segments when it can
+  grade_check(<material> | *)             check the grade at the face before loading; a mismatch becomes an exception
+  respect_closures(<zone> | *)            re-plan when a road closes for blasting; never drive into a closed road
+Zones: {', '.join(sorted(W.zones))}. "benches" = every one-lane bench road and cut under a highwall.
+Materials: ore (face A, to the crusher), lowgrade (B, stockpile), waste (C, waste dump), sand (D, sand stockpile).
+Physics: haul trucks drive up to 43 km/h empty and 32 km/h loaded, brake at 2 m/s^2 (stopping distance ~ v^2/4 m,
+v in m/s) and see {SENSOR_RANGE / 1000:.0f} m ahead with lidar. A rock that falls closer than the stopping distance
+cannot be avoided by braking; clearance rules only act on obstacles already sensed.
+Prefer the fix that generalises (the widest zone where the same hazard exists, a targeted material over *) at the
+lowest production cost. If `business` is given, put the trade-off in money: the estimated cost of one such incident
+vs what a fix's throughput cost means in loads per hour, and say it in the findings. Always call a tool; finish
+with submit_findings."""
 
 
 def _compact(tool: str, res: dict) -> dict:
@@ -317,10 +317,7 @@ class Investigation:
                                      transport=self.transport) as http:
             model = await _pick_model(http, s)
             self.source = f"{s.inference_provider}:{model}"
-            # OpenAI's reasoning models only take function tools on the Responses API;
-            # other OpenAI-compatible endpoints (Vultr Serverless Inference) speak Chat Completions.
-            convo: Conversation = (Responses if s.inference_provider == "openai" else Chat)(
-                http, s, model, "Investigate this incident.\n" + json.dumps(self.ctx), self)
+            convo: Conversation = Chat(http, s, model, "Investigate this incident.\n" + json.dumps(self.ctx), self)
             nudges = turns = 0
             while True:
                 turns += 1
@@ -428,7 +425,7 @@ class Conversation(Protocol):
 
 
 class Chat:
-    """Chat Completions with function tools (any OpenAI-compatible endpoint)."""
+    """Vultr Serverless Inference: Chat Completions with function tools."""
 
     def __init__(self, http: httpx.AsyncClient, s: Settings, model: str, task: str, inv: Investigation) -> None:
         self.http, self.s, self.model, self.inv = http, s, model, inv
@@ -437,16 +434,13 @@ class Chat:
     async def ask(self, force: bool) -> tuple[str, list[Call]]:
         body: dict[str, Any] = {"model": self.model, "messages": self.messages, "tools": TOOLS,
                                 "tool_choice": {"type": "function", "function": {"name": "submit_findings"}}
-                                if force else "required", "parallel_tool_calls": False}
-        if self.s.inference_provider == "openai":
-            body["max_completion_tokens"] = 6000
-        else:
-            body["max_tokens"] = 1500
-            body["temperature"] = 0.2
+                                if force else "required", "parallel_tool_calls": False,
+                                "max_tokens": 1500, "temperature": 0.2}
         data = await self.inv.post(self.http, f"{self.s.inference_url}/chat/completions", body, self.model)
         usage = data.get("usage") or {}
         self.inv.tokens["in"] += int(usage.get("prompt_tokens") or 0)
         self.inv.tokens["out"] += int(usage.get("completion_tokens") or 0)
+        USAGE.record("investigator", int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0))
         msg = data["choices"][0]["message"]
         calls = msg.get("tool_calls") or []
         self.messages.append({"role": "assistant", "content": msg.get("content") or "",
@@ -459,45 +453,6 @@ class Chat:
 
     def say(self, text: str) -> None:
         self.messages.append({"role": "user", "content": text})
-
-
-RESPONSES_TOOLS = [{"type": "function", **t["function"]} for t in TOOLS]
-
-
-class Responses:
-    """OpenAI Responses API: reasoning models with function tools. The conversation is kept
-    server-side and continued with previous_response_id, so reasoning carries across turns."""
-
-    def __init__(self, http: httpx.AsyncClient, s: Settings, model: str, task: str, inv: Investigation) -> None:
-        self.http, self.s, self.model, self.inv = http, s, model, inv
-        self.prev: str | None = None
-        self.pending: list[dict] = [{"role": "user", "content": task}]
-
-    async def ask(self, force: bool) -> tuple[str, list[Call]]:
-        body: dict[str, Any] = {"model": self.model, "instructions": SYSTEM_PROMPT, "input": self.pending,
-                                "tools": RESPONSES_TOOLS, "parallel_tool_calls": False,
-                                "tool_choice": {"type": "function", "name": "submit_findings"} if force else "required",
-                                "max_output_tokens": 8000, "reasoning": {"effort": "low"}}
-        if self.prev:
-            body["previous_response_id"] = self.prev
-        data = await self.inv.post(self.http, f"{self.s.inference_url}/responses", body, self.model)
-        usage = data.get("usage") or {}
-        self.inv.tokens["in"] += int(usage.get("input_tokens") or 0)
-        self.inv.tokens["out"] += int(usage.get("output_tokens") or 0)
-        self.prev, self.pending = data["id"], []
-        text, calls = [], []
-        for item in data.get("output") or []:
-            if item.get("type") == "function_call":
-                calls.append((item["call_id"], item["name"], item.get("arguments")))
-            elif item.get("type") == "message":
-                text += [c.get("text", "") for c in item.get("content") or [] if c.get("type") == "output_text"]
-        return " ".join(t for t in text if t), calls
-
-    def results(self, outputs: list[tuple[str, str]]) -> None:
-        self.pending += [{"type": "function_call_output", "call_id": cid, "output": out} for cid, out in outputs]
-
-    def say(self, text: str) -> None:
-        self.pending.append({"role": "user", "content": text})
 
 
 # ---------------------------------------------------------------- persistence (Postgres)

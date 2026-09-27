@@ -47,14 +47,12 @@ def read_session(token: str | None, secret: str) -> str | None:
 
 
 def current_user(request: Request) -> str:
-    user = read_session(request.cookies.get(COOKIE), request.app.state.settings.session_secret)
-    if user is None:
-        raise HTTPException(401, "login required")
-    return user
+    """The operator UI is open. A session cookie still names the user when one is present."""
+    return read_session(request.cookies.get(COOKIE), request.app.state.settings.session_secret) or "ops"
 
 
 def ws_user(ws: WebSocket) -> str | None:
-    return read_session(ws.cookies.get(COOKIE), ws.app.state.settings.session_secret)
+    return read_session(ws.cookies.get(COOKIE), ws.app.state.settings.session_secret) or "ops"
 
 
 def require_node(request: Request) -> None:

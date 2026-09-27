@@ -20,7 +20,7 @@ class Settings:
     session_secret: str
     admin_user: str
     admin_password: str
-    inference_provider: str   # openai | vultr (any OpenAI-compatible endpoint works)
+    inference_provider: str   # always "vultr": Vultr Serverless Inference
     inference_key: str
     inference_url: str
     inference_model: str
@@ -34,20 +34,17 @@ class Settings:
         return bool(self.inference_key)
 
 
-INFERENCE_URLS = {
-    "openai": "https://api.openai.com/v1",
-    "vultr": "https://api.vultrinference.com/v1",
-}
+VULTR_INFERENCE_URL = "https://api.vultrinference.com/v1"
 
 
 def _inference(env: os._Environ[str]) -> tuple[str, str, str, str]:
-    """(provider, key, url, model). INFERENCE_* wins; VULTR_INFERENCE_* still works."""
+    """(provider, key, url, model). Every model call goes to Vultr Serverless Inference."""
+    provider = env.get("INFERENCE_PROVIDER") or "vultr"
+    if provider != "vultr":
+        raise RuntimeError(f"INFERENCE_PROVIDER={provider!r}: only Vultr Serverless Inference (vultr) is supported")
     key = env.get("INFERENCE_KEY") or env.get("VULTR_INFERENCE_KEY", "")
-    provider = env.get("INFERENCE_PROVIDER") or ("vultr" if env.get("VULTR_INFERENCE_KEY") else "openai")
-    url = env.get("INFERENCE_URL") or env.get("VULTR_INFERENCE_URL") or INFERENCE_URLS.get(provider, "")
+    url = env.get("INFERENCE_URL") or env.get("VULTR_INFERENCE_URL") or VULTR_INFERENCE_URL
     model = env.get("INFERENCE_MODEL") or env.get("VULTR_INFERENCE_MODEL", "")
-    if key and not url:
-        raise RuntimeError(f"INFERENCE_URL must be set for provider {provider!r}")
     return provider, key, url.rstrip("/"), model
 
 
