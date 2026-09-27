@@ -7,12 +7,12 @@ dependencies = []
 
 [project.optional-dependencies]
 # VM A: control plane + web app
-control = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "asyncpg>=0.29", "httpx>=0.27"]
+control = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "asyncpg>=0.29", "httpx>=0.27", "cryptography>=42"]
 # VM B: live sim + fleet API + replay workers
-sim = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "httpx>=0.27"]
+sim = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "httpx>=0.27", "cryptography>=42"]
 
 [dependency-groups]
-dev = ["pytest>=8", "fastapi>=0.115", "httpx>=0.27", "asyncpg>=0.29"]
+dev = ["pytest>=8", "fastapi>=0.115", "httpx>=0.27", "asyncpg>=0.29", "cryptography>=42"]
 
 [build-system]
 requires = ["hatchling"]
