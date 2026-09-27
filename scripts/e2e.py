@@ -82,14 +82,23 @@ def main() -> None:
     if len(good) != len(reps) or len(hashes) != 1:
         raise SystemExit("FAIL  reproduction is not exact")
 
-    d = wait("hypotheses posted", lambda: (x := detail())["hypotheses"] and x, 120)
-    print(f"      diagnosis by {d['hypotheses'][0]['source']}:")
+    d = wait("investigation finished, fixes posted", lambda: (x := detail())["hypotheses"] and x, 300)
+    inv = d.get("investigation") or {}
+    rep = inv.get("report") or {}
+    print(f"      investigation #{inv.get('id')} by {inv.get('source')}: {len(inv.get('steps', []))} steps, "
+          f"{inv.get('sims')} simulations")
+    for s in inv.get("steps", []):
+        print(f"        {s['n']:>2}. {s['tool']:<16} {(s['summary'] or '')[:110]}")
+    for r in rep.get("rejected", []):
+        print(f"        rejected {r['fix']}: {r['reason'][:90]}")
     d = wait("every trial finished and gated",
              lambda: (x := detail())["failure"]["status"] in ("awaiting_approval", "no_fix") and x, 180)
     latest = max(h["round"] for h in d["hypotheses"])
     for h in [h for h in d["hypotheses"] if h["round"] == latest]:
         trial = next((x for x in d["replays"] if x["hypothesis_id"] == h["id"] and x["kind"] == "trial"), {})
-        print(f"        #{h['rank']} {h['fix_dsl']:<40} trial={trial.get('outcome')} status={h['status']}")
+        rob = (h.get("evidence") or {}).get("robustness")
+        print(f"        #{h['rank']} {h['fix_dsl']:<40} trial={trial.get('outcome')} "
+              f"robust={'–' if rob is None else f'{rob:.0%}'} status={h['status']}")
     ready = [h for h in d["hypotheses"] if h["round"] == latest and h["status"] == "ready"]
     if not ready:
         raise SystemExit(f"FAIL  no hypothesis passed the gate (failure status {d['failure']['status']})")

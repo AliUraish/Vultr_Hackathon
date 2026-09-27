@@ -10,19 +10,23 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hmac
+import json
 import logging
 import os
 import secrets
 import time
 from collections import deque
+from pathlib import Path
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
+from replay_core.hoststats import host_stats
 from replay_core.live import LiveSim
 from replay_core.policy import PolicyError, make_policy
 from replay_core.scenarios import SCENARIOS, check_hints
+from replay_core.signing import SignatureError, Verifier
 from replay_core.state import state_hash
 from replay_core.world import MAP_HASH, TICK_HZ, W
 
@@ -34,11 +38,47 @@ BATCH_TICKS = 50
 MAX_BUFFER_TICKS = 10 * 60 * TICK_HZ  # 10 minutes of telemetry while the control plane is away
 
 
+class Witness:
+    """VM B's own append-only copy of the audit ledger's block heads (see control/ledger.py)."""
+
+    def __init__(self, path: str | None) -> None:
+        self.path = Path(path) if path else None
+        self.blocks: dict[int, dict] = {}
+        if self.path and self.path.exists():
+            for line in self.path.read_text().splitlines():
+                with contextlib.suppress(ValueError, KeyError):
+                    b = json.loads(line)
+                    self.blocks[int(b["n"])] = b
+
+    def add(self, block: dict) -> bool:
+        n = int(block["n"])
+        seen = self.blocks.get(n)
+        if seen is not None:
+            if seen["hash"] != block["hash"]:
+                raise ValueError(f"block {n} was already witnessed with a different hash")
+            return False
+        rec = {"n": n, "hash": block["hash"], "merkle_root": block.get("merkle_root"),
+               "prev_hash": block.get("prev_hash"), "events": block.get("events"), "at": time.time()}
+        if self.path:  # on disk first: a head only counts as witnessed once it is durable
+            with self.path.open("a") as f:
+                f.write(json.dumps(rec) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+        self.blocks[n] = rec
+        return True
+
+
 class Node:
     def __init__(self, control_url: str, token: str, seed: int,
-                 transport: httpx.AsyncBaseTransport | None = None) -> None:
+                 transport: httpx.AsyncBaseTransport | None = None, verifier: Verifier | None = None,
+                 witness: Witness | None = None) -> None:
         self.http = httpx.AsyncClient(base_url=control_url, headers={"X-Node-Token": token}, timeout=10.0,
                                       transport=transport)
+        self.verifier = verifier
+        self.witness = witness or Witness(None)
+        self.tick_ms: deque[float] = deque(maxlen=600)
+        self.late_ticks = 0
+        self.rejected_policies = 0
         self.seed = seed
         self.run_id = f"run-{time.strftime('%Y%m%d-%H%M%S')}-{seed % 10000:04d}"
         self.sim: LiveSim | None = None
@@ -57,17 +97,21 @@ class Node:
                                          json={"run_id": self.run_id, "seed": self.seed, "map": MAP_HASH})
                 r.raise_for_status()
                 pol = r.json()["policy"]
+                if self.verifier:  # never start the fleet on rules the control plane did not sign
+                    self.verifier.verify(pol["version"], pol["rules"], pol.get("signature"))
                 self.sim = LiveSim(self.seed, pol["rules"], pol["version"])
                 log.info("run %s started, seed %s, policy v%s", self.run_id, self.seed, pol["version"])
                 return
-            except (httpx.HTTPError, KeyError) as exc:
+            except (httpx.HTTPError, KeyError, SignatureError) as exc:
                 log.warning("control plane not ready (%s); retrying in %.0fs", exc, delay)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 10.0)
 
     def tick_once(self) -> None:
         assert self.sim is not None
+        t0 = time.perf_counter()
         rec = self.sim.tick()
+        self.tick_ms.append((time.perf_counter() - t0) * 1000)
         self.frame = rec.frame
         self.outbox.append({"tick": rec.tick, "hash": rec.hash, "inputs": rec.inputs, "frame": rec.frame})
         if rec.snapshot is not None:
@@ -94,6 +138,7 @@ class Node:
             if delay > 0:
                 await asyncio.sleep(delay)
             else:
+                self.late_ticks += 1
                 if delay < -1.0:  # fell far behind (e.g. the VM paused): don't try to catch up
                     due = loop.time()
                 await asyncio.sleep(0)
@@ -107,7 +152,7 @@ class Node:
         snaps = list(self.snapshots)
         notices = list(self.notices)
         body = {"run": {"id": self.run_id, "seed": self.seed}, "ticks": ticks, "snapshots": snaps,
-                "notices": notices, "policy_version": self.sim.state["policy"]["version"]}
+                "notices": notices, "policy_version": self.sim.state["policy"]["version"], "host": self.stats()}
         try:
             r = await self.http.post("/api/node/telemetry", json=body)
             r.raise_for_status()
@@ -120,6 +165,16 @@ class Node:
             self.snapshots.popleft()
         del self.notices[:len(notices)]
         return True
+
+    def stats(self) -> dict:
+        ms = sorted(self.tick_ms)
+        pick = (lambda q: round(ms[min(len(ms) - 1, int(q * len(ms)))], 3)) if ms else (lambda q: None)
+        return {**host_stats(), "tick_ms_p50": pick(0.5), "tick_ms_p99": pick(0.99), "late_ticks": self.late_ticks,
+                "buffered_ticks": len(self.outbox), "dropped_ticks": self.dropped,
+                "policy_signing": {"mode": "ed25519" if self.verifier else "unsigned",
+                                   "key_id": self.verifier.key_id if self.verifier else None,
+                                   "rejected": self.rejected_policies},
+                "witnessed_blocks": len(self.witness.blocks)}
 
     async def send(self) -> None:
         while True:
@@ -138,7 +193,10 @@ def _settings() -> tuple[str, str, int]:
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     control, token, seed = _settings()
-    node = Node(control, token, seed)
+    verifier = Verifier.from_file(os.environ.get("POLICY_PUBLIC_KEY_FILE"))
+    if verifier is None:
+        log.warning("no POLICY_PUBLIC_KEY_FILE: accepting unsigned policies")
+    node = Node(control, token, seed, verifier=verifier, witness=Witness(os.environ.get("WITNESS_FILE")))
     app.state.node, app.state.token = node, token
     await node.hello()
     tasks = [asyncio.create_task(node.run()), asyncio.create_task(node.send())]
@@ -182,6 +240,22 @@ class Chaos(BaseModel):
 class Policy(BaseModel):
     version: int
     rules: list[str]
+    signature: str | None = None
+
+
+class Service(BaseModel):
+    robot: str
+    op: str
+    cell: list[int] | None = None
+    by: str = ""
+
+
+class Block(BaseModel):
+    n: int
+    hash: str
+    merkle_root: str | None = None
+    prev_hash: str | None = None
+    events: int | None = None
 
 
 def _check_steps(steps: list[dict]) -> None:
@@ -238,9 +312,48 @@ async def policy(body: Policy, node: Node = Depends(get_node)) -> dict:
         make_policy(body.rules, body.version)
     except PolicyError as exc:
         raise HTTPException(400, str(exc)) from exc
+    if node.verifier:
+        try:
+            node.verifier.verify(body.version, body.rules, body.signature)
+        except SignatureError as exc:
+            node.rejected_policies += 1
+            log.warning("rejected policy v%s: %s", body.version, exc)
+            raise HTTPException(403, str(exc)) from exc
     assert node.sim is not None
     return {"input_id": node.sim.submit({"kind": "policy", "version": body.version, "rules": body.rules}),
             "applies_at_tick": node.sim.tick_no}
+
+
+@app.post("/fleet/service", dependencies=Auth)
+async def service(body: Service, node: Node = Depends(get_node)) -> dict:
+    """Service control for a faulted or standby robot: move (remote), standby, deploy, repair."""
+    if body.robot not in W.robot_caps:
+        raise HTTPException(404, f"no robot {body.robot}")
+    if body.op not in ("move", "standby", "deploy", "repair"):
+        raise HTTPException(400, "op must be move, standby, deploy or repair")
+    if body.op == "move" and not (body.cell and len(body.cell) == 2 and W.passable((body.cell[0], body.cell[1]))):
+        raise HTTPException(400, "move needs a floor cell")
+    inp = {"kind": "service", "robot": body.robot, "op": body.op, "by": body.by[:60]}
+    if body.op == "move":
+        inp["cell"] = [body.cell[0], body.cell[1]]
+    assert node.sim is not None
+    return {"input_id": node.sim.submit(inp), "tick": node.sim.tick_no}
+
+
+@app.post("/fleet/witness", dependencies=Auth)
+async def witness(body: Block, request: Request) -> dict:
+    node: Node = request.app.state.node
+    try:
+        added = node.witness.add(body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"witnessed": body.n, "new": added}
+
+
+@app.get("/fleet/witness", dependencies=Auth)
+async def witnessed(request: Request) -> dict:
+    node: Node = request.app.state.node
+    return {"blocks": [{"n": n, "hash": b["hash"]} for n, b in sorted(node.witness.blocks.items())]}
 
 
 @app.get("/fleet/state", dependencies=Auth)
@@ -253,4 +366,5 @@ async def health(request: Request) -> dict:
     node: Node = request.app.state.node
     return {"ok": node.sim is not None, "run_id": node.run_id,
             "tick": node.sim.tick_no if node.sim else None,
-            "buffered_ticks": len(node.outbox), "dropped_ticks": node.dropped}
+            "buffered_ticks": len(node.outbox), "dropped_ticks": node.dropped,
+            "policy_signing": "ed25519" if node.verifier else "unsigned"}
