@@ -9,6 +9,7 @@ import time
 from replay_core.dispatch import choose_robot, make_cmd, requirements
 from replay_core.world import CELL, JOB_DEADLINE_TICKS, W
 
+from . import enterprise
 from .db import log_event
 from .runtime import Runtime
 from .simnode_client import SimNodeError
@@ -24,7 +25,7 @@ class JobError(ValueError):
     pass
 
 
-async def create_job(rt: Runtime, slots: list[str], dock: str, source: str) -> dict:
+async def create_job(rt: Runtime, slots: list[str], dock: str, source: str, order: dict | None = None) -> dict:
     if not 1 <= len(slots) <= 3:
         raise JobError("a job picks 1 to 3 slots")
     bad = [s for s in slots if s not in W.slots]
@@ -37,11 +38,20 @@ async def create_job(rt: Runtime, slots: list[str], dock: str, source: str) -> d
     async with rt.pool.acquire() as c, c.transaction():
         seq = await c.fetchval("SELECT nextval('job_seq')")
         jid = f"J{seq}"
+        if order is not None:
+            await c.execute(
+                "INSERT INTO orders (id, customer_id, dock, carrier, lines, value, priority, status, job_id, ship_by) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, 'released', $8, $9)",
+                order["id"], order["customer_id"], order["dock"], order["carrier"], order["lines"], order["value"],
+                order["priority"], jid, order["ship_by"])
         row = await c.fetchrow(
-            "INSERT INTO jobs (id, kind, lines, dock, status, run_id, created_tick, deadline_tick) "
-            "VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7) RETURNING *",
-            jid, kind, lines, dock, rt.run_id, rt.last_tick, rt.last_tick + JOB_DEADLINE_TICKS)
-        await log_event(c, "job.created", {"job": jid, "lines": lines, "dock": dock, "source": source},
+            "INSERT INTO jobs (id, kind, lines, dock, status, run_id, created_tick, deadline_tick, order_id) "
+            "VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8) RETURNING *",
+            jid, kind, lines, dock, rt.run_id, rt.last_tick, rt.last_tick + JOB_DEADLINE_TICKS,
+            order["id"] if order else None)
+        await log_event(c, "job.created", {"job": jid, "lines": lines, "dock": dock, "source": source,
+                                           **({"order": order["id"], "customer": order["customer"],
+                                               "value": order["value"]} if order else {})},
                         run_id=rt.run_id, tick=rt.last_tick)
     job = dict(row)
     rt.hub.publish("job", job)
@@ -87,10 +97,12 @@ async def dispatch_once(rt: Runtime) -> None:
         rt.hub.publish("job", {"id": j["id"], "status": "assigned", "robot_id": rid})
 
 
-def _random_job(rng: random.Random) -> tuple[list[str], str]:
-    # Heavy (rack F) picks are rare: only R4 can lift them.
-    pool = [s for s in sorted(W.slots) if not s.startswith("F") or rng.random() < 0.08]
-    return rng.sample(pool, rng.choice([1, 1, 1, 2])), rng.choice(sorted(W.docks))
+async def release_order(rt: Runtime, rng: random.Random) -> dict:
+    """A customer order from the site's catalog becomes a pick job for the fleet."""
+    async with rt.pool.acquire() as c:
+        seq = await c.fetchval("SELECT nextval('order_seq')")
+    order = enterprise.make_order(rt.site, rng, seq)
+    return await create_job(rt, [x["slot"] for x in order["lines"]], order["dock"], "order", order)
 
 
 async def loop(rt: Runtime) -> None:
@@ -99,13 +111,12 @@ async def loop(rt: Runtime) -> None:
     while True:
         await asyncio.sleep(1.0)
         try:
-            if rt.auto_jobs and rt.sim_online and time.monotonic() - last_gen > 3.0:
+            if rt.auto_jobs and rt.sim_online and rt.site and time.monotonic() - last_gen > 3.0:
                 async with rt.pool.acquire() as c:
                     open_jobs = await c.fetchval(
                         "SELECT count(*) FROM jobs WHERE status IN ('pending', 'assigned', 'active')")
                 if open_jobs < MAX_OPEN_AUTO_JOBS:
-                    slots, dock = _random_job(rng)
-                    await create_job(rt, slots, dock, "auto")
+                    await release_order(rt, rng)
                     last_gen = time.monotonic()
             await dispatch_once(rt)
         except Exception:  # keep the fleet loop alive; the error is in the log

@@ -31,7 +31,7 @@ async def hello(rt: Runtime, body: dict) -> dict:
         await c.execute("UPDATE jobs SET status = 'pending', robot_id = NULL, created_tick = NULL "
                         "WHERE status IN ('assigned', 'active') AND run_id IS DISTINCT FROM $1", run_id)
     rt.run_id, rt.last_tick, rt.frame = run_id, 0, None
-    return {"policy": {"version": pol["version"], "rules": pol["rules"]}}
+    return {"policy": {"version": pol["version"], "rules": pol["rules"], "signature": pol.get("signature")}}
 
 
 async def telemetry(rt: Runtime, body: dict) -> dict:
@@ -40,6 +40,7 @@ async def telemetry(rt: Runtime, body: dict) -> dict:
     ticks: list[dict] = body.get("ticks", [])
     snaps: list[dict] = body.get("snapshots", [])
     new_failures: list[dict] = []
+    alarms: list[tuple[int, dict]] = []
 
     async with rt.pool.acquire() as c, c.transaction():
         await c.execute("INSERT INTO runs (id, seed, map_hash) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
@@ -73,6 +74,8 @@ async def telemetry(rt: Runtime, body: dict) -> dict:
                         "UPDATE jobs SET status = 'active', assigned_tick = $2, robot_id = $3, run_id = $4 "
                         "WHERE id = $1 AND status IN ('pending', 'assigned')",
                         inp["job"]["id"], tick - 1, inp["robot"], run_id)
+                    await c.execute("UPDATE orders SET status = 'picking' WHERE job_id = $1 AND status = 'released'",
+                                    inp["job"]["id"])
             for e in t["frame"]["ev"]:
                 if e["type"] == "cmd":
                     continue  # same fact as the input above
@@ -80,9 +83,18 @@ async def telemetry(rt: Runtime, body: dict) -> dict:
                 if e["type"] == "job_done" and e.get("job"):
                     await c.execute("UPDATE jobs SET status = $2, done_tick = $3, result = $4 WHERE id = $1",
                                     e["job"], "done" if e["ok"] else "wrong_item", tick, e)
+                    await c.execute("UPDATE orders SET status = $2, shipped_at = now() WHERE job_id = $1",
+                                    e["job"], "shipped" if e["ok"] else "short_shipped")
+                elif e["type"] == "job_released" and e.get("job"):  # a faulted robot hands its job back
+                    await c.execute("UPDATE jobs SET status = 'pending', robot_id = NULL, created_tick = NULL "
+                                    "WHERE id = $1 AND status IN ('assigned', 'active')", e["job"])
+                    await c.execute("UPDATE orders SET status = 'released' WHERE job_id = $1 AND status = 'picking'", e["job"])
+                elif e["type"] == "fault_alarm":
+                    alarms.append((tick, e))
                 elif e["type"] == "job_exception" and e.get("job"):
                     await c.execute("UPDATE jobs SET status = 'exception', done_tick = $2, result = $3 "
                                     "WHERE id = $1", e["job"], tick, e)
+                    await c.execute("UPDATE orders SET status = 'exception' WHERE job_id = $1", e["job"])
             for f in detect(t["frame"]):
                 await flush()  # keep the log in tick order
                 eid = await log_event(c, "failure", f, run_id=run_id, tick=f["tick"], robot_id=f["robot"])
@@ -104,7 +116,14 @@ async def telemetry(rt: Runtime, body: dict) -> dict:
     if ticks and run_id == rt.run_id:
         rt.frame, rt.last_tick, rt.frame_at = ticks[-1]["frame"], ticks[-1]["tick"], time.monotonic()
     rt.sim_policy_version = body.get("policy_version")
+    rt.sim_host = body.get("host") or rt.sim_host
+    if rt.service is not None:
+        for t in ticks:
+            rt.service.observe(t["frame"])
+        for tick, e in alarms:
+            await rt.service.open_case(run_id, tick, e)
     if ticks:
+        rt.meters["ticks"].add(len(ticks))
         rt.hub.publish("frames", [ui_frame(t["frame"]) for t in ticks])
     for f in new_failures:
         log.info("failure %s %s at tick %s", f["type"], f["robot"], f["tick"])

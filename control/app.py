@@ -11,10 +11,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -23,9 +25,12 @@ from replay_core.frames import ui_frame
 from replay_core.scenarios import SCENARIOS, reinject_hints
 from replay_core.world import TICK_HZ, W
 
-from . import auth, db, fleet, ingest, policies
+from replay_core.signing import Signer
+
+from . import assistant, auth, db, enterprise, fleet, ingest, ledger, platform, policies, service
 from .bus import Hub
 from .config import load
+from .lab import Lab, LabError
 from .orchestrator import Orchestrator, WorkflowError, original_chaos
 from .runtime import Runtime
 from .simnode_client import SimNode, SimNodeError
@@ -51,6 +56,19 @@ async def _retention(rt: Runtime) -> None:
             log.exception("retention")
 
 
+async def _provision_site(rt: Runtime) -> None:
+    """First boot of a database: the model writes the enterprise profile (a minute at most)."""
+    for attempt in range(5):
+        try:
+            rt.site = await enterprise.ensure_site(rt.pool, rt.settings)
+            rt.hub.publish("site", {"code": rt.site["code"], "name": rt.site["name"]})
+            log.info("site %s (%s) from %s", rt.site["code"], rt.site["name"], rt.site["source"])
+            return
+        except Exception:
+            log.exception("provisioning the site (attempt %d)", attempt + 1)
+            await asyncio.sleep(5)
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = load()
@@ -58,17 +76,24 @@ async def lifespan(app: FastAPI):
     applied = await db.migrate(pool)
     if applied:
         log.info("applied migrations: %s", ", ".join(applied))
+    signer = Signer.from_file(settings.policy_key_file)
+    if signer is None:
+        log.warning("no POLICY_SIGNING_KEY_FILE: policies go to the fleet unsigned")
     async with pool.acquire() as c, c.transaction():
-        await policies.ensure_base(c)
+        await policies.ensure_base(c, signer)
         if await c.fetchval("SELECT 1 FROM users WHERE username = $1", settings.admin_user) is None:
             await c.execute("INSERT INTO users (username, pw_hash) VALUES ($1, $2)",
                             settings.admin_user, auth.hash_password(settings.admin_password))
     rt = Runtime(settings, pool, Hub(), SimNode(settings.simnode_url, settings.node_token),
                  auto_jobs=settings.auto_jobs)
     rt.orchestrator = Orchestrator(rt)
+    rt.lab = Lab(rt)
+    rt.signer = signer
+    rt.service = service.ServiceDesk(rt)
     app.state.settings, app.state.rt = settings, rt
     tasks = [asyncio.create_task(rt.orchestrator.loop()), asyncio.create_task(fleet.loop(rt)),
-             asyncio.create_task(_retention(rt))]
+             asyncio.create_task(_retention(rt)), asyncio.create_task(ledger.loop(rt)),
+             asyncio.create_task(_provision_site(rt)), asyncio.create_task(rt.service.loop())]
     try:
         yield
     finally:
@@ -79,6 +104,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Replay control plane", lifespan=lifespan)
+app.add_middleware(GZipMiddleware, minimum_size=1024)  # three.js and JSON: ~4x smaller on the wire
 app.mount("/static", StaticFiles(directory=WEB), name="static")
 
 
@@ -119,6 +145,7 @@ class ResultBody(BaseModel):
     matches_live: bool | None = None
     first_divergence: int | None = None
     frames: list[dict] | None = None
+    result: dict | None = None
     duration_ms: int | None = None
     error: str | None = None
 
@@ -135,14 +162,16 @@ async def node_telemetry(body: dict, rt: Runtime = Depends(get_rt)) -> dict:
 
 @app.post("/api/node/replays/claim", dependencies=[Node], response_model=None)
 async def claim(body: ClaimBody, rt: Runtime = Depends(get_rt)) -> Response | dict:
+    rt.workers.setdefault(body.worker, {})["last_claim"] = time.time()
+    rt.meters["claims"].add()
     async with rt.pool.acquire() as c:
         r = await c.fetchrow(
             "UPDATE replays SET status = 'running', worker = $1, started_at = now() WHERE id = ("
             "  SELECT id FROM replays WHERE status = 'queued' ORDER BY CASE kind WHEN 'reproduce' THEN 0 "
-            "  WHEN 'trial' THEN 1 WHEN 'proof' THEN 1 WHEN 'regression' THEN 2 ELSE 3 END, id "
+            "  WHEN 'render' THEN 0 WHEN 'regression' THEN 2 WHEN 'suite' THEN 3 ELSE 1 END, id "
             "  LIMIT 1 FOR UPDATE SKIP LOCKED) "
-            "RETURNING id, capsule_id, hypothesis_id, kind, policy_version, policy_rules, control_rules, "
-            "control_failures", body.worker)
+            "RETURNING id, capsule_id, hypothesis_id, experiment_id, kind, policy_version, policy_rules, "
+            "control_rules, control_failures, spec", body.worker)
         if r is None:
             return Response(status_code=204)
         capsule_hash = await c.fetchval("SELECT hash FROM capsules WHERE id = $1", r["capsule_id"])
@@ -164,22 +193,27 @@ async def replay_result(rid: int, body: ResultBody, rt: Runtime = Depends(get_rt
         r = await c.fetchrow(
             "UPDATE replays SET status = $2, outcome = $3, failures = $4, new_failures = $5, trajectory_hash = $6, "
             "matches_live = $7, first_divergence = $8, frames = $9, duration_ms = $10, error = $11, "
-            "warnings = $12, finished_at = now() WHERE id = $1 AND status = 'running' "
-            "RETURNING id, capsule_id, hypothesis_id, kind, worker",
+            "warnings = $12, result = $13, finished_at = now() WHERE id = $1 AND status = 'running' "
+            "RETURNING id, capsule_id, hypothesis_id, experiment_id, kind, worker",
             rid, body.status, body.outcome, body.failures, body.new_failures, body.trajectory_hash,
-            body.matches_live, body.first_divergence, body.frames, body.duration_ms, body.error, body.warnings)
+            body.matches_live, body.first_divergence, body.frames, body.duration_ms, body.error, body.warnings,
+            body.result)
         if r is None:
             raise HTTPException(409, "replay is not running (requeued or already finished)")
         summary = {"replay": rid, "capsule": r["capsule_id"], "kind": r["kind"], "hypothesis": r["hypothesis_id"],
-                   "status": body.status, "outcome": body.outcome, "trajectory_hash": body.trajectory_hash,
-                   "matches_live": body.matches_live, "worker": r["worker"], "duration_ms": body.duration_ms,
-                   "error": body.error}
+                   "experiment": r["experiment_id"], "status": body.status, "outcome": body.outcome,
+                   "trajectory_hash": body.trajectory_hash, "matches_live": body.matches_live, "worker": r["worker"],
+                   "duration_ms": body.duration_ms, "error": body.error}
         await db.log_event(c, "replay.done", summary)
-    rt.hub.publish("replay", {"id": rid, "capsule_id": r["capsule_id"], "kind": r["kind"], "status": body.status,
-                              "outcome": body.outcome, "matches_live": body.matches_live,
-                              "trajectory_hash": body.trajectory_hash, "hypothesis_id": r["hypothesis_id"]})
-    assert rt.orchestrator is not None
+    msg = {"id": rid, "capsule_id": r["capsule_id"], "kind": r["kind"], "status": body.status,
+           "outcome": body.outcome, "matches_live": body.matches_live, "trajectory_hash": body.trajectory_hash,
+           "hypothesis_id": r["hypothesis_id"], "experiment_id": r["experiment_id"], "worker": r["worker"],
+           "duration_ms": body.duration_ms}
+    # experiment batches are progress ticks for the investigation view, not incident-page changes
+    rt.hub.publish("lab" if r["experiment_id"] else "replay", msg)
+    assert rt.orchestrator is not None and rt.lab is not None
     rt.orchestrator.kick()
+    rt.lab.wake()
     return {"ok": True}
 
 
@@ -235,11 +269,14 @@ async def world_map(user: str = User) -> dict:
 async def state(user: str = User, rt: Runtime = Depends(get_rt)) -> dict:
     async with rt.pool.acquire() as c:
         pol = await policies.current(c)
-        jobs = await c.fetch("SELECT id, kind, lines, dock, status, robot_id, deadline_tick FROM jobs "
+        jobs = await c.fetch("SELECT id, kind, lines, dock, status, robot_id, deadline_tick, order_id FROM jobs "
                              "WHERE status IN ('pending', 'assigned', 'active') ORDER BY created_at")
         inbox = await c.fetchval("SELECT count(*) FROM failures WHERE status <> ALL($1::text[])",
                                  ["fixed", "dismissed", "lost"])
-    return {**rt.status(), "policy": {"version": pol["version"], "rules": pol["rules"], "hash": pol["hash"]},
+    return {**rt.status(), "policy": {"version": pol["version"], "rules": pol["rules"], "hash": pol["hash"],
+                                      "signed": bool(pol.get("signature")), "key_id": pol.get("key_id")},
+            "site": {"code": rt.site["code"], "name": rt.site["name"], "company": rt.site["facility"]["company"]}
+            if rt.site else None,
             "frame": ui_frame(rt.frame) if rt.frame else None, "jobs": db.rows(jobs), "open_failures": inbox}
 
 
@@ -321,12 +358,41 @@ async def failure(fid: int, user: str = User, rt: Runtime = Depends(get_rt)) -> 
                 "AND r.status = 'done') AS regression_done FROM hypotheses h WHERE capsule_id = $1 "
                 "ORDER BY round DESC, rank", cid))
             hyp_ids = [h["id"] for h in out["hypotheses"]]
+        out["investigation"] = await _investigation(c, fid)
+        order = await enterprise.failure_order(c, f)
+        out["order"] = db.row(order)
+        out["impact"] = enterprise.impact(rt.site, f["type"], order) if rt.site else None
         out["chain"] = db.rows(await c.fetch(
             "SELECT id, ts, tick, robot_id, type, payload FROM events WHERE id = $1 "
-            "OR (type IN ('failure.status', 'capsule.cut', 'diagnosis') AND payload->>'failure' = $2) "
+            "OR (type IN ('failure.status', 'capsule.cut', 'diagnosis', 'investigation.started', "
+            "'investigation.done') AND payload->>'failure' = $2) "
             "OR (type IN ('replay.queued', 'replay.done', 'approval') AND payload->>'capsule' = $3) "
             "OR (type = 'hypothesis.status' AND (payload->>'hypothesis')::int = ANY($4::int[])) "
             "ORDER BY id", f["event_id"], str(fid), str(cid), hyp_ids))
+    return out
+
+
+async def _investigation(c, fid: int, inv_id: int | None = None) -> dict | None:
+    """The latest investigation of a failure (or a given one), with its trace and experiments."""
+    inv = await c.fetchrow("SELECT * FROM investigations WHERE ($2::int IS NOT NULL AND id = $2) "
+                           "OR ($2::int IS NULL AND failure_id = $1) ORDER BY id DESC LIMIT 1", fid, inv_id)
+    if inv is None:
+        return None
+    steps = await c.fetch("SELECT n, tool, args, why, status, summary, experiment_id, created_at, finished_at "
+                          "FROM investigation_steps WHERE investigation_id = $1 ORDER BY n", inv["id"])
+    exps = await c.fetch("SELECT id, kind, params, status, summary, sims, duration_ms, error, created_at, finished_at, "
+                         "(SELECT count(*) FROM replays r WHERE r.experiment_id = e.id) AS jobs, "
+                         "(SELECT count(*) FROM replays r WHERE r.experiment_id = e.id AND r.status = 'done') AS jobs_done "
+                         "FROM experiments e WHERE investigation_id = $1 ORDER BY id", inv["id"])
+    return {**dict(inv), "steps": db.rows(steps), "experiments": db.rows(exps)}
+
+
+@app.get("/api/investigations/{iid}")
+async def investigation(iid: int, user: str = User, rt: Runtime = Depends(get_rt)) -> dict:
+    async with rt.pool.acquire() as c:
+        out = await _investigation(c, 0, iid)
+    if out is None:
+        raise HTTPException(404, "no such investigation")
     return out
 
 
@@ -399,6 +465,166 @@ async def replay(rid: int, user: str = User, rt: Runtime = Depends(get_rt)) -> d
     if r is None:
         raise HTTPException(404, "no such replay")
     return dict(r)
+
+
+class ExperimentBody(BaseModel):
+    kind: str = Field(pattern="^(reproduce|isolate|what_if|stress|tune)$")
+    fix: str | None = Field(default=None, max_length=120)
+    rules: list[str] | None = Field(default=None, max_length=4)
+    values: list[float] | None = Field(default=None, max_length=12)
+    n: int | None = Field(default=None, ge=6, le=60)
+
+
+class RenderBody(BaseModel):
+    variant: int = Field(ge=0, le=60)
+    which: str = Field(default="fix", pattern="^(fix|base)$")
+    fix: str | None = Field(default=None, max_length=120)
+
+
+async def _lab(coro) -> dict:
+    try:
+        return await coro
+    except LabError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.get("/api/capsules/{cid}/experiments")
+async def experiments(cid: int, user: str = User, rt: Runtime = Depends(get_rt)) -> list[dict]:
+    assert rt.lab is not None
+    return await rt.lab.history(cid)
+
+
+@app.post("/api/capsules/{cid}/experiments")
+async def run_experiment(cid: int, body: ExperimentBody, user: str = User, rt: Runtime = Depends(get_rt)) -> dict:
+    """An operator runs one instrument by hand (the investigator uses the same ones)."""
+    lab = rt.lab
+    assert lab is not None
+    if body.kind in ("stress", "tune") and not body.fix:
+        raise HTTPException(400, f"{body.kind} needs a fix")
+    if body.kind == "what_if" and not (body.rules or body.fix):
+        raise HTTPException(400, "what_if needs rules")
+    runs = {
+        "reproduce": lambda: lab.reproduce(cid),
+        "isolate": lambda: lab.isolate(cid),
+        "what_if": lambda: lab.what_if(cid, body.rules or [body.fix or ""]),
+        "stress": lambda: lab.stress(cid, body.fix or "", body.n),
+        "tune": lambda: lab.tune(cid, body.fix or "", body.values, body.n),
+    }
+    async with rt.pool.acquire() as c:
+        await db.log_event(c, "experiment.requested", {"capsule": cid, "by": user, **body.model_dump()})
+    return await _lab(runs[body.kind]())
+
+
+@app.get("/api/experiments/{eid}")
+async def experiment(eid: int, user: str = User, rt: Runtime = Depends(get_rt)) -> dict:
+    assert rt.lab is not None
+    try:
+        return await rt.lab.get(eid)
+    except LabError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/experiments/{eid}/render")
+async def render_variant(eid: int, body: RenderBody, user: str = User, rt: Runtime = Depends(get_rt)) -> dict:
+    assert rt.lab is not None
+    return await _lab(rt.lab.render(eid, body.variant, body.which, body.fix))
+
+
+@app.get("/api/site")
+async def site(user: str = User, rt: Runtime = Depends(get_rt)) -> dict:
+    if rt.site is None:
+        raise HTTPException(503, "the site is still being provisioned")
+    return rt.site
+
+
+@app.get("/api/orders")
+async def orders(limit: int = 40, user: str = User, rt: Runtime = Depends(get_rt)) -> list[dict]:
+    async with rt.pool.acquire() as c:
+        return db.rows(await c.fetch(
+            "SELECT o.*, c.name AS customer, c.tier FROM orders o JOIN customers c ON c.id = o.customer_id "
+            "ORDER BY o.created_at DESC LIMIT $1", max(1, min(limit, 200))))
+
+
+@app.get("/api/kpis")
+async def kpis(user: str = User, rt: Runtime = Depends(get_rt)) -> dict:
+    return await enterprise.kpis(rt)
+
+
+class AskBody(BaseModel):
+    question: str = Field(min_length=1, max_length=600)
+    scope: str = Field(default="site", pattern="^(robot|site)$")
+    robot: str | None = Field(default=None, pattern="^R[0-9]{1,2}$")
+    history: list[dict] = Field(default_factory=list, max_length=12)
+
+
+@app.post("/api/ask")
+async def ask(body: AskBody, user: str = User, rt: Runtime = Depends(get_rt)) -> dict:
+    """The operations copilot: a question about one robot or the whole site, answered from live data."""
+    if body.scope == "robot" and not body.robot:
+        raise HTTPException(400, "which robot?")
+    try:
+        return await assistant.ask(rt, user, body.question, body.scope, body.robot if body.scope == "robot" else None,
+                                   body.history)
+    except assistant.AskError as exc:
+        raise HTTPException(429 if "too many" in str(exc) else 409, str(exc)) from exc
+
+
+@app.get("/api/service")
+async def service_cases(user: str = User, rt: Runtime = Depends(get_rt)) -> list[dict]:
+    """Open trailer service cases, and the ones resolved in the last 10 minutes."""
+    return await service.open_cases(rt.pool)
+
+
+@app.post("/api/service/{cid}/done")
+async def service_done(cid: int, user: str = User, rt: Runtime = Depends(get_rt)) -> dict:
+    """The operator marks a technician's repair done (the technician normally does)."""
+    try:
+        return await rt.service.mark_done(cid, user)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.get("/api/robots/{rid}/events")
+async def robot_events(rid: str, limit: int = 40, user: str = User, rt: Runtime = Depends(get_rt)) -> list[dict]:
+    """A robot's recent activity in the current run, newest first (backfills the live log)."""
+    async with rt.pool.acquire() as c:
+        return db.rows(await c.fetch(
+            "SELECT id, tick, type, payload FROM events WHERE run_id = $1 AND robot_id = $2 "
+            "AND (type LIKE 'sim.%' OR type IN ('dispatch', 'failure', 'input.chaos')) ORDER BY id DESC LIMIT $3",
+            rt.run_id, rid, max(1, min(limit, 200))))
+
+
+@app.get("/api/platform")
+async def platform_view(user: str = User, rt: Runtime = Depends(get_rt)) -> dict:
+    return await platform.snapshot(rt)
+
+
+@app.get("/api/audit")
+async def audit(user: str = User, rt: Runtime = Depends(get_rt)) -> dict:
+    async with rt.pool.acquire() as c:
+        blocks = db.rows(await c.fetch("SELECT * FROM audit_blocks ORDER BY n DESC LIMIT 12"))
+        unsealed = await c.fetchval("SELECT count(*) FROM events WHERE seq IS NULL")
+        total = await c.fetchval("SELECT COALESCE(max(n), 0) FROM audit_blocks")
+    return {"blocks": blocks, "total_blocks": total, "unsealed": unsealed,
+            "signing": {"mode": "ed25519" if rt.signer else "unsigned", "key_id": rt.signer.key_id if rt.signer else None}}
+
+
+@app.post("/api/audit/verify")
+async def audit_verify(user: str = User, rt: Runtime = Depends(get_rt)) -> dict:
+    res = await ledger.verify(rt)
+    async with rt.pool.acquire() as c:
+        await db.log_event(c, "audit.verified", {"by": user, **{k: res[k] for k in ("ok", "blocks", "events",
+                                                                                      "head", "problem_count", "ms")},
+                                                  "witness": res["witness"]})
+    return res
+
+
+@app.get("/api/audit/proof/{event_id}")
+async def audit_proof(event_id: int, user: str = User, rt: Runtime = Depends(get_rt)) -> dict:
+    try:
+        return await ledger.proof(rt, event_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.get("/api/regression")

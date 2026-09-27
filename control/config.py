@@ -27,6 +27,7 @@ class Settings:
     auto_jobs: bool
     cookie_secure: bool
     retention_hours: int
+    policy_key_file: str = ""
 
     @property
     def inference_enabled(self) -> bool:
@@ -67,4 +68,5 @@ def load() -> Settings:
         auto_jobs=env.get("AUTO_JOBS", "1") == "1",
         cookie_secure=env.get("COOKIE_SECURE", "0") == "1",
         retention_hours=int(env.get("TICK_RETENTION_HOURS", "12")),
+        policy_key_file=env.get("POLICY_SIGNING_KEY_FILE", ""),
     )
