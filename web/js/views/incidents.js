@@ -9,7 +9,7 @@ export function mount(root) {
     <div class="panel">
       <div class="panel-head">
         <div><h2>Incidents</h2>
-          <div class="hint">Every failure the safety rules catch is recorded exactly, replayed, investigated and tested against fixes. You approve.</div></div>
+          <div class="page-lede">Every failure the safety rules catch in the pit (a collision, a wrong material at a dump, a truck in a blast zone) is recorded exactly, replayed on VM B, investigated by the AI in simulation and tested against fixes. A person approves the fix.</div></div>
         <div class="row wrap">
           <span class="chip">open <b id="inc-open" data-v="0">0</b></span>
           <span class="chip">fixed <b id="inc-fixed" data-v="0">0</b></span>
@@ -39,6 +39,6 @@ export async function show() {
       <td class="mono">${f.replayed ? `${f.reproduced}/${f.replayed} exact` : "–"}</td>
       <td>${statusPill(f.status)}</td>
       <td class="dim">→</td></tr>`).join("")
-    : `<tr><td colspan="8"><div class="empty">No incidents yet. Inject one from the Floor.</div></td></tr>`;
+    : `<tr><td colspan="8"><div class="empty">No incidents yet. Inject a hazard from the Live pit or the Haul map.</div></td></tr>`;
   for (const tr of $$("#inc-rows tr.link")) tr.onclick = () => (location.hash = `#/incident/${tr.dataset.id}`);
 }

@@ -1,4 +1,4 @@
-// Event log with a rewind floor: every tick of the fleet is in Postgres on VM A.
+// Audit log with a rewind map: every tick of the fleet is in Postgres on VM A.
 import { $, $$, esc, api, summarize, debounce, cfg, bus, short, toast, pill } from "../util.js";
 import { Floor } from "../floor.js";
 
@@ -15,7 +15,7 @@ export function mount(root) {
     </div>
     <div class="log-layout">
       <div class="panel">
-        <div class="panel-head"><h3>Rewind the floor</h3><span class="tag" id="log-tick">t –</span></div>
+        <div class="panel-head"><h3>Rewind the pit</h3><span class="tag" id="log-tick">t –</span></div>
         <div class="stage"><canvas id="log-canvas"></canvas></div>
         <input type="range" class="range" id="log-scrub" min="0" max="0" value="0" style="margin-top:12px">
         <div class="hint">Every tick of the fleet is stored in Postgres on VM A. Drag to any moment, or click an event.</div>

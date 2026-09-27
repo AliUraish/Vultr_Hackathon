@@ -6,8 +6,8 @@ export function mount(root) {
   root.innerHTML = `
     <div class="panel">
       <div class="panel-head">
-        <div><h2>Regression suite</h2>
-          <div class="hint">Every approved fix leaves its capsule here. A new fix must keep all of them clean before it can ship.</div></div>
+        <div><h2>Proven fixes</h2>
+          <div class="page-lede">Every approved fix leaves its incident here as a test. A new haul rule must keep all of them clean (replayed on VM B) before it can ship to the fleet.</div></div>
         <button class="primary" id="suite-run">Re-check all against current policy</button>
       </div>
       <div class="suite" id="suite"></div>

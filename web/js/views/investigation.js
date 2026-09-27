@@ -96,7 +96,7 @@ function renderHead() {
   const st = { running: ["investigating", "info live"], done: ["done", "ok"], error: ["failed", "bad"] }[inv.status] || [inv.status, ""];
   $("#inv-status", root).innerHTML = pill(...st);
   const [prov, model] = String(inv.source || "").split(":");
-  const who = { openai: "OpenAI", vultr: "Vultr Inference", scripted: "the scripted investigator", starting: "" }[prov] ?? prov;
+  const who = { vultr: "Vultr Serverless Inference", scripted: "the scripted investigator", starting: "" }[prov] ?? prov;
   $("#inv-source", root).textContent = who ? `driven by ${who}${model ? ` · ${model}` : ""}` : "";
   countTo($("#inv-steps", root), inv.steps.length);
   countTo($("#inv-sims", root), inv.sims, { ms: 900 });

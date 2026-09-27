@@ -1,13 +1,15 @@
-// Floor view: the live fleet, incident injection, robot inspector, jobs.
-import { $, $$, esc, api, act, toast, bus, cfg, mps, sparkline, countTo, money, ago, item, itemLabel, pill, TIER } from "../util.js";
+// Haul map: the pit from above, live, with production numbers, hazard injection, the truck inspector and load tickets.
+import { $, $$, esc, api, act, toast, bus, cfg, mps, sparkline, countTo, money, ago, item, pill, TIER, excavator, faceName, destination, zoneLabel } from "../util.js";
 import { Floor, robotColor, stopDist } from "../floor.js";
 import { live } from "../live.js";
 
 const CHAOS = [
-  { key: "pallet_drop", ico: "▣", title: "Pallet falls in an aisle", desc: "Lands just ahead of a fast robot", fires: "pallet_dropped" },
-  { key: "mislabel_bin", ico: "⌗", title: "Bin gets mislabeled", desc: "A robot on its way picks the wrong item", fires: "bin_mislabeled" },
-  { key: "worker_in_aisle", ico: "⛔", title: "Worker closes an aisle", desc: "A robot is already routed through it", fires: "zone_restricted" },
-  { key: "clear_floor", ico: "✦", title: "Clear the floor", desc: "Remove pallets, fix labels, reopen aisles", clear: true },
+  { key: "rockfall", ico: "◆", title: "Rock falls off a highwall", desc: "Lands on a bench road just ahead of a fast truck", fires: "rock_fell" },
+  { key: "road_damage", ico: "◌", title: "Pothole opens up", desc: "On a road ahead of a working truck", fires: "pothole_formed" },
+  { key: "grade_mixup", ico: "⌗", title: "Grade mix-up at a face", desc: "A truck on its way loads the wrong material", fires: "grade_mislabeled" },
+  { key: "blast_closure", ico: "⛔", title: "Close a bench for blasting", desc: "A truck is already routed through it", fires: "zone_restricted" },
+  { key: "tire_fault", ico: "◍", title: "Tyre failure", desc: "The AI pulls it over and pages a fitter", fires: "fault_alarm" },
+  { key: "clear_roads", ico: "✦", title: "Clear the roads", desc: "Rocks, closures, fresh potholes", clear: true },
 ];
 
 let floor = null, raf = 0, lastUi = 0, current = null, cellZones = null, kpiTimer = null, orders = [];
@@ -15,18 +17,19 @@ const armed = new Map();              // chaos key -> button
 const robotEvents = new Map();        // robot id -> recent event strings
 
 const KPIS = [
-  ["orders_per_hour", "orders / hour", (v) => v],
-  ["shipped", "orders shipped", (v) => v],
-  ["units_shipped", "units shipped", (v) => v],
-  ["value_shipped", "value shipped", (v) => money(v)],
-  ["on_time_pct", "picked on time", (v) => (v == null ? "–" : `${v.toFixed(1)}%`)],
-  ["open", "orders in progress", (v) => v],
+  ["orders_per_hour", "loads / hour", (v) => v],
+  ["shipped", "loads dumped", (v) => v],
+  ["units_shipped", "tonnes moved", (v) => v],
+  ["value_shipped", "value moved", (v) => money(v)],
+  ["on_time_pct", "loads on time", (v) => (v == null ? "–" : `${v.toFixed(1)}%`)],
+  ["ai_decisions_hour", "AI decisions / hour", (v) => v],
   ["incidents_open", "open incidents", (v) => v],
   ["last_safety_incident", "since last safety incident", (v) => (v ? ago(v) : "none")],
 ];
 
 function template() {
   return `
+  <div class="page-head"><h2>Haul map</h2><div class="page-lede">The pit from above, live: haul roads, benches, dig faces and dump points, every truck with its lidar cone, potholes the fleet has mapped, and what the mine has produced this shift.</div></div>
   <div class="kpis" id="kpis">${KPIS.map(([k, label]) => `<div class="kpi" data-k="${k}"><b data-v="0">–</b><span>${label}</span></div>`).join("")}</div>
   <div class="floor-layout">
     <div>
@@ -36,38 +39,40 @@ function template() {
         <div class="overlay-tl"><span class="tag" id="fl-tick">t –</span><span class="tag" id="fl-moving">– moving</span><span class="tag" id="fl-jobs">– jobs</span></div>
         <div class="overlay-tr" id="fl-toggles">
           <button class="toggle on" data-opt="trails">Trails</button>
-          <button class="toggle on" data-opt="sensors">Sensors</button>
-          <button class="toggle" data-opt="paths">Routes</button>
+          <button class="toggle on" data-opt="sensors">Lidar</button>
+          <button class="toggle on" data-opt="paths">Routes</button>
           <button class="toggle" data-opt="heat">Congestion</button>
         </div>
       </div>
       <div class="legend">
-        ${["R1", "R2", "R3", "R4"].map((r) => `<span><i style="background:${robotColor(r)};box-shadow:0 0 8px ${robotColor(r)}"></i>${r}${r === "R4" ? " · heavy lift" : ""}</span>`).join("")}
-        <span><i style="background:var(--pallet)"></i>dropped pallet</span>
-        <span><i style="background:rgba(255,59,92,.35);border:1px solid var(--bad)"></i>closed aisle</span>
-        <span><i style="background:rgba(0,229,255,.35)"></i>sensor range</span>
-        <span><i style="background:rgba(255,59,92,.5)"></i>too fast to stop in range</span>
+        <span><i style="background:#f5b800"></i>excavator (dig face)</span>
+        <span><i style="background:#e3a800;border-radius:2px"></i>haul truck</span>
+        <span><i style="background:#8a6a4a;border-radius:50%"></i>fallen rock</span>
+        <span><i style="background:#1a0f06;border:1px dashed #f5b800;border-radius:50%"></i>pothole (mapped)</span>
+        <span><i style="background:rgba(255,59,79,.35);border:1px solid var(--bad)"></i>closed for blasting</span>
+        <span><i style="background:rgba(245,184,0,.35)"></i>lidar / stopping reach</span>
+        <span><i style="background:rgba(255,59,79,.5)"></i>too fast to stop in range</span>
       </div>
     </div>
     <aside>
       <div class="panel">
-        <div class="panel-head"><h3>Inject an incident</h3></div>
+        <div class="panel-head"><h3>Inject a hazard</h3><span class="hint">fires when a truck is in position</span></div>
         <div class="chaos-list" id="chaos-list">
           ${CHAOS.map((c) => `<button class="chaos ${c.clear ? "clear" : ""}" data-s="${c.key}">
             <span class="ico">${c.ico}</span><span><b>${esc(c.title)}</b><span>${esc(c.desc)}</span></span><span class="go">${c.clear ? "Run" : "Inject"}</span></button>`).join("")}
         </div>
       </div>
       <div class="panel">
-        <div class="panel-head"><h3>Fleet</h3><span class="hint">click a robot</span></div>
+        <div class="panel-head"><h3>Haul fleet</h3><span class="hint">click a truck</span></div>
         <div class="robot-list" id="robot-list"></div>
       </div>
       <div class="panel">
-        <div class="panel-head"><h3>Order book</h3>
-          <label class="hint row"><input type="checkbox" id="auto-jobs"> release orders</label></div>
+        <div class="panel-head"><h3>Load tickets</h3>
+          <label class="hint row"><input type="checkbox" id="auto-jobs"> faces raise loads</label></div>
         <div class="order-list" id="order-list"><div class="skeleton"></div></div>
-        <details class="manual"><summary class="hint">Manual pick job</summary>
+        <details class="manual"><summary class="hint">Manual load</summary>
           <form id="job-form">
-            <input id="job-slots" placeholder="slots, e.g. C4, A2" autocomplete="off">
+            <select id="job-slots"></select>
             <select id="job-dock"></select>
             <button type="submit" class="primary">Add</button>
           </form></details>
@@ -82,7 +87,8 @@ export function mount(root) {
   cellZones = {};
   for (const [z, cells] of Object.entries(map.zones)) for (const c of cells) (cellZones[c.join(",")] ||= []).push(z);
   floor = new Floor($("#floor-canvas"), map);
-  $("#job-dock").innerHTML = Object.keys(map.docks).map((d) => `<option>${d}</option>`).join("");
+  $("#job-dock").innerHTML = Object.keys(map.docks).map((d) => `<option value="${d}">${esc(destination(d))}</option>`).join("");
+  $("#job-slots").innerHTML = Object.keys(map.slots).map((s) => `<option value="${s}">${esc(faceName(s))}</option>`).join("");
 
   for (const b of $$("#fl-toggles button")) {
     b.onclick = () => { floor.opt[b.dataset.opt] = !floor.opt[b.dataset.opt]; b.classList.toggle("on", floor.opt[b.dataset.opt]); };
@@ -90,8 +96,8 @@ export function mount(root) {
   for (const b of $$("#chaos-list button")) {
     b.onclick = async () => {
       const c = CHAOS.find((x) => x.key === b.dataset.s);
-      const r = await act(() => api("/api/chaos", { body: { scenario: c.key } }), c.clear ? "Floor cleared" : null);
-      if (r && !c.clear) { b.classList.add("armed"); armed.set(c.fires, b); toast(`${c.title}: armed, fires as soon as a robot is in position`, "warn"); }
+      const r = await act(() => api("/api/chaos", { body: { scenario: c.key } }), c.clear ? "Roads cleared" : null);
+      if (r && !c.clear) { b.classList.add("armed"); armed.set(c.fires, b); toast(`${c.title}: armed, fires as soon as a truck is in position`, "warn"); }
     };
   }
   $("#floor-canvas").addEventListener("click", (e) => {
@@ -103,9 +109,7 @@ export function mount(root) {
   $("#auto-jobs").onchange = (e) => act(() => api("/api/jobs/auto", { body: { enabled: e.target.checked } }));
   $("#job-form").onsubmit = (e) => {
     e.preventDefault();
-    const slots = $("#job-slots").value.split(/[\s,]+/).filter(Boolean).map((s) => s.toUpperCase());
-    act(() => api("/api/jobs", { body: { slots, dock: $("#job-dock").value } }), (j) => `Job ${j.id} queued`)
-      .then((j) => { if (j) $("#job-slots").value = ""; });
+    act(() => api("/api/jobs", { body: { slots: [$("#job-slots").value], dock: $("#job-dock").value } }), (j) => `Load ${j.id} queued`);
   };
   bus.on("state", renderJobs);
   window.addEventListener("resize", () => floor && floor.layout());
@@ -121,9 +125,10 @@ function binTip(e) {
   if (!it && !carrier) { tip.hidden = true; return; }
   tip.hidden = false;
   tip.style.left = `${e.clientX - rect.left + 14}px`; tip.style.top = `${e.clientY - rect.top + 12}px`;
-  tip.innerHTML = it ? `<b>${esc(slot)}</b> <span class="mono">${esc(it.sku)}</span><br>${esc(it.name)}<br>
-      <span class="hint">${esc(it.category)} · ${esc(it.cls.replace("_", " "))} · ${money(it.unit_value, 2)} / ${esc(it.uom)} · ${it.unit_weight} kg</span>`
-    : `<b>${esc(dock)}</b> dock door<br>${esc(carrier.carrier)} · ${esc(carrier.service)}<br><span class="hint">cutoff ${esc(carrier.cutoff)}</span>`;
+  const ex = slot && excavator(slot);
+  tip.innerHTML = it ? `<b>${esc(ex.id)}</b> · face ${esc(slot)} <span class="mono">${esc(ex.model || "")}</span><br>${esc(it.name)} <span class="mono">${esc(it.sku)}</span><br>
+      <span class="hint">${esc(it.grade || it.category)} · ${money(it.unit_value)}/t · ${Math.round(it.unit_weight)} t per load → ${esc(destination(cfg.map.destination[it.cls]))}</span>`
+    : `<b>${esc(carrier.carrier)}</b> · ${esc(dock)}<br>${esc(carrier.service)}<br><span class="hint">throughput ${esc(carrier.cutoff)}</span>`;
 }
 
 async function refreshKpis() {
@@ -143,8 +148,8 @@ async function refreshKpis() {
   } catch { /* next poll */ }
 }
 
-const OSTAT = { released: ["released", ""], picking: ["picking", "info live"], shipped: ["shipped", "ok"],
-  short_shipped: ["wrong item shipped", "bad"], exception: ["exception", "warn"] };
+const OSTAT = { released: ["waiting for a truck", ""], picking: ["hauling", "info live"], shipped: ["dumped", "ok"],
+  short_shipped: ["wrong material", "bad"], exception: ["exception", "warn"] };
 
 function renderOrders() {
   const el = $("#order-list");
@@ -153,9 +158,9 @@ function renderOrders() {
     <div class="order ${o.status}">
       <div class="row between"><span class="mono">${esc(o.id)}</span>${pill(...(OSTAT[o.status] || [o.status, ""]))}</div>
       <div class="row between"><span>${esc(o.customer)} ${o.tier !== "standard" ? pill(o.tier, TIER[o.tier]) : ""}${o.priority === "expedite" ? " " + pill("expedite", "warn") : ""}</span><b>${money(o.value)}</b></div>
-      <div class="lines">${o.lines.map((l) => `${l.qty} × ${esc(l.name)} <span class="dim">${esc(l.slot)}</span>`).join("<br>")}</div>
-      <div class="hint">${esc(o.carrier)} → ${esc(o.dock)}${o.job_id ? ` · job ${esc(o.job_id)}` : ""}</div>
-    </div>`).join("") : `<div class="empty">No orders yet: the site is being provisioned.</div>`;
+      <div class="lines">${o.lines.map((l) => `${l.qty} t ${esc(l.name)} <span class="dim">${esc(faceName(l.slot))}</span>`).join("<br>")}</div>
+      <div class="hint">→ ${esc(o.carrier)}${o.job_id ? ` · ${esc(o.job_id)}` : ""}</div>
+    </div>`).join("") : `<div class="empty">No loads yet: the mine is being set up.</div>`;
 }
 
 export function show() {
@@ -193,13 +198,13 @@ export function hide() { cancelAnimationFrame(raf); clearInterval(kpiTimer); clo
 
 function renderSide(f) {
   $("#fl-tick").innerHTML = `t <b>${f.t}</b> · ${(f.t / cfg.tickHz).toFixed(0)}s`;
-  $("#fl-moving").innerHTML = `<b>${f.robots.filter((r) => r.st === "moving").length}</b> moving`;
+  $("#fl-moving").innerHTML = `<b>${f.robots.filter((r) => r.st === "moving").length}</b> hauling`;
   $("#robot-list").innerHTML = f.robots.map((r) => `
     <div class="robot-row ${floor.selected === r.id ? "sel" : ""}" data-id="${r.id}">
       <span class="av" style="background:${robotColor(r.id)};box-shadow:0 0 12px ${robotColor(r.id)}66">${r.id}</span>
-      <div><div class="st ${r.st}">${esc(r.st)}</div><div class="meta">${esc(jobLabel(r.job))}${r.c ? " · carrying" : ""}</div></div>
-      <div style="text-align:right"><div class="mono">${mps(r.v)} m/s</div>
-        <div class="speedbar"><i style="width:${Math.min(100, r.v / 120 * 100)}%;background:${robotColor(r.id)}"></i></div></div>
+      <div><div class="st ${r.st}">${esc(r.st.replace("_", " "))}</div><div class="meta">${esc(jobLabel(r.job))}${r.c ? " · loaded" : ""}</div></div>
+      <div style="text-align:right"><div class="mono">${mps(r.v)} km/h</div>
+        <div class="speedbar"><i style="width:${Math.min(100, r.v / 1200 * 100)}%;background:${robotColor(r.id)}"></i></div></div>
     </div>`).join("");
   for (const el of $$("#robot-list .robot-row")) el.onclick = () => openInspector(el.dataset.id);
   if (floor.selected) renderInspector();
@@ -207,7 +212,7 @@ function renderSide(f) {
 
 let jobsById = {};
 function jobLabel(jid) {
-  if (!jid) return "no job";
+  if (!jid) return "no load";
   const j = jobsById[jid], o = j && j.order_id && orders.find((x) => x.id === j.order_id);
   return o ? `${jid} · ${o.id} · ${o.customer}` : jid;
 }
@@ -216,7 +221,7 @@ function renderJobs(st) {
   if (!$("#order-list")) return;
   $("#auto-jobs").checked = st.auto_jobs;
   jobsById = Object.fromEntries(st.jobs.map((j) => [j.id, j]));
-  $("#fl-jobs").innerHTML = `<b>${st.jobs.length}</b> open jobs`;
+  $("#fl-jobs").innerHTML = `<b>${st.jobs.length}</b> open loads`;
 }
 
 // ------------------------------------------------------------------ inspector
@@ -241,8 +246,8 @@ function renderInspector() {
     el.innerHTML = `
       <button class="close icon" id="insp-close">✕</button>
       <div class="who"><span class="av" style="background:${robotColor(id)};box-shadow:0 0 14px ${robotColor(id)}">${id}</span>
-        <div><b>${id}</b> <span class="hint">${id === "R4" ? "heavy lift" : "standard"}</span></div></div>
-      <div class="big" id="insp-speed">0.0 <small>m/s</small></div>
+        <div><b>${id}</b> <span class="hint">haul truck</span></div></div>
+      <div class="big" id="insp-speed">0 <small>km/h</small></div>
       <canvas id="insp-spark"></canvas>
       <div class="kv" id="insp-kv"></div>
       <div class="kv asset" id="insp-asset"></div>
@@ -251,27 +256,28 @@ function renderInspector() {
     $("#insp-close").onclick = closeInspector;
   }
   const cell = [Math.floor(r.x / cfg.map.cell_mm), Math.floor(r.y / cfg.map.cell_mm)];
-  const zones = (cellZones[cell.join(",")] || []).filter((z) => z !== "racks").join(", ") || "open floor";
-  const stop = stopDist(r.v) + 100;
-  $("#insp-speed").innerHTML = `${mps(r.v)} <small>m/s</small>`;
+  const zones = (cellZones[cell.join(",")] || []).filter((z) => !["haul_roads", "ramps", "benches", "bench_upper", "bench_lower"].includes(z)).map(zoneLabel).join(", ") || "road";
+  const lidar = (cfg.map.physics?.lidar_m || 60) * 1000;
+  const stop = stopDist(r.v) + (cfg.map.physics?.clearance_m || 3) * 1000;
+  $("#insp-speed").innerHTML = `${mps(r.v)} <small>km/h</small>`;
   $("#insp-kv").innerHTML = `
-    <span>status</span><span class="st ${r.st}">${esc(r.st)}</span>
-    <span>job</span><span class="mono">${esc(jobLabel(r.job))}</span>
-    <span>carrying</span><span>${r.c ? `${r.c} item${r.c > 1 ? "s" : ""}` : "nothing"}</span>
+    <span>status</span><span class="st ${r.st}">${esc(r.st.replace("_", " "))}</span>
+    <span>load</span><span class="mono">${esc(jobLabel(r.job))}</span>
+    <span>carrying</span><span>${r.c ? "a full tray" : "empty"}</span>
     <span>where</span><span class="mono">c${cell[0]}_${cell[1]} · ${esc(zones)}</span>
-    <span>stopping</span><span style="color:${stop > 800 ? "var(--bad)" : "var(--ok)"}">${(stop / 1000).toFixed(2)} m of 0.80 m sensed</span>
-    <span>route</span><span class="mono">${r.p && r.p.length ? `${r.p.length}+ cells` : "–"}</span>`;
+    <span>stopping</span><span style="color:${stop > lidar ? "var(--bad)" : "var(--ok)"}">${(stop / 1000).toFixed(0)} m of ${(lidar / 1000).toFixed(0)} m lidar</span>
+    <span>route</span><span class="mono">${r.p && r.p.length ? `${r.p.length}+ segments` : "–"}</span>`;
   const a = cfg.site && cfg.site.robots.find((x) => x.id === id);
   $("#insp-asset").innerHTML = a ? `
     <span>model</span><span>${esc(a.model)}</span><span>serial</span><span class="mono">${esc(a.serial)}</span>
     <span>firmware</span><span class="mono">${esc(a.firmware)}</span><span>in service</span><span>${esc(a.commissioned)}</span>
-    <span>payload</span><span>${a.payload_kg} kg</span>` : "";
-  sparkline($("#insp-spark"), live.robotHistory.get(id) || [], { color: robotColor(id), max: 120 });
+    <span>payload</span><span>${a.payload_t} t</span>` : "";
+  sparkline($("#insp-spark"), live.robotHistory.get(id) || [], { color: robotColor(id), max: 1200 });
   $("#insp-evs").innerHTML = (robotEvents.get(id) || []).map((s) => `<div>${esc(s)}</div>`).join("") || `<div class="dim">none yet</div>`;
 }
 
 export function onKey(e) {
   if (e.key === "Escape") closeInspector();
-  if (/^[1-4]$/.test(e.key) && e.altKey) openInspector(`R${e.key}`);
+  if (/^[1-9]$/.test(e.key) && e.altKey) openInspector(`T0${e.key}`);
 }
 
