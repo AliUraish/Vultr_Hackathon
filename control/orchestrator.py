@@ -1,7 +1,8 @@
 """The workflow engine: deterministic rules that move each failure through the pipeline.
 
-    open --(T+2 s recorded)--> reproducing --(replay matches live)--> diagnosing
-      --> trials --(fix avoids failure)--> regression --(suite still clean)--> awaiting_approval
+    open --(T+2 s recorded)--> reproducing --(replay matches live)--> diagnosing (the investigator
+      runs its experiments) --> trials --(fix avoids the incident and is robust across variants)-->
+      regression --(suite still clean)--> awaiting_approval
       --(human approves)--> fixed   (+ policy vN+1 pushed to the fleet, capsule joins the suite)
 
 Every transition is idempotent and is written to the event log in the same
@@ -19,8 +20,10 @@ import asyncpg
 
 from replay_core import capsule as caps
 
-from . import diagnosis, policies
+from . import diagnosis, enterprise, policies
 from .db import log_event
+from .investigator import MAX_SIMS, MAX_STEPS, DbRecorder, Investigation
+from .lab import MIN_ROBUSTNESS
 from .runtime import Runtime
 from .simnode_client import SimNodeError
 
@@ -33,6 +36,15 @@ STUCK_SECONDS = 120
 
 class WorkflowError(ValueError):
     pass
+
+
+def _robustness(h: asyncpg.Record | dict) -> dict:
+    """Stress-test numbers shown with the gate (empty for fixes that did not come from an investigation)."""
+    ev = h["evidence"] or {}
+    if not ev:
+        return {}
+    return {"robustness": ev.get("robustness"), "cost_pct": ev.get("cost_pct"), "min_robustness": MIN_ROBUSTNESS,
+            "stress_experiment": ev.get("experiment")}
 
 
 CAUSES = {"collision": "pallet_drop", "wrong_item": "mislabel_bin", "zone_breach": "worker_in_aisle"}
@@ -235,32 +247,80 @@ class Orchestrator:
                                        "AND (type LIKE 'sim.%' OR type LIKE 'input.%' OR type = 'dispatch') "
                                        "ORDER BY id DESC LIMIT 50", f["run_id"], f["tick"])
                 cur = await policies.current(c)
+                business = await enterprise.business_context(c, self.rt.site, f)
             ctx = diagnosis.context(k["blob"], dict(f), [dict(e) for e in reversed(events)], list(cur["rules"]))
-            hyps, source, notes = await diagnosis.diagnose(self.rt.settings, ctx)
             recorded = caps.policy_at(k["blob"], f["tick"])  # what the fleet ran when it failed
+            ctx["recorded_policy"] = recorded
+            if business:
+                ctx["business"] = business
+            hyps, source, notes, inv = await self._investigate(f, k["id"], ctx)
             async with pool.acquire() as c, c.transaction():
                 rnd = (await c.fetchval("SELECT max(round) FROM hypotheses WHERE capsule_id = $1", k["id"]) or 0) + 1
                 await c.execute("UPDATE hypotheses SET status = 'superseded' WHERE capsule_id = $1 "
                                 "AND status IN ('trial', 'regression', 'ready')", k["id"])
                 await log_event(c, "diagnosis", {"failure": fid, "capsule": k["id"], "round": rnd, "source": source,
-                                                 "hypotheses": hyps, "notes": notes},
+                                                 "hypotheses": [{k2: h[k2] for k2 in ("cause", "fix", "rationale")}
+                                                                for h in hyps],
+                                                 "notes": notes, "investigation": inv},
                                 run_id=f["run_id"], tick=f["tick"], robot_id=f["robot_id"])
                 for rank, h in enumerate(hyps, 1):
                     hid = await c.fetchval(
-                        "INSERT INTO hypotheses (capsule_id, round, rank, cause, fix_dsl, rationale, source, status) "
-                        "VALUES ($1, $2, $3, $4, $5, $6, $7, 'trial') RETURNING id",
-                        k["id"], rnd, rank, h["cause"], h["fix"], h["rationale"], source)
+                        "INSERT INTO hypotheses (capsule_id, round, rank, cause, fix_dsl, rationale, source, status, "
+                        "investigation_id, evidence) VALUES ($1, $2, $3, $4, $5, $6, $7, 'trial', $8, $9) RETURNING id",
+                        k["id"], rnd, rank, h["cause"], h["fix"], h["rationale"], source, inv, h.get("evidence"))
                     rules = recorded + ([h["fix"]] if h["fix"] not in recorded else [])
                     await self._enqueue(c, k["id"], "trial", hypothesis_id=hid, rules=rules,
                                         control_failures=repro["failures"] if repro else None)
                 f = await c.fetchrow("SELECT * FROM failures WHERE id = $1", fid)
                 await self._status(c, f, "trials" if hyps else "no_fix",
-                                   None if hyps else "the diagnosis produced no valid fix")
+                                   None if hyps else "the investigation produced no valid fix")
         except Exception:
             log.exception("diagnosis of failure %s", fid)
         finally:
             self._diagnosing.discard(fid)
             self.kick()
+
+    async def _investigate(self, f: asyncpg.Record, cid: int, ctx: dict
+                           ) -> tuple[list[dict], str, list[str], int | None]:
+        """Run the incident investigator; (hypotheses, source, notes, investigation id).
+        If it crashes outright, fall back to the one-shot diagnosis so the incident still moves."""
+        rt = self.rt
+        async with rt.pool.acquire() as c, c.transaction():
+            await c.execute("UPDATE investigations SET status = 'error', error = 'interrupted', finished_at = now() "
+                            "WHERE failure_id = $1 AND status = 'running'", f["id"])
+            inv = await c.fetchval("INSERT INTO investigations (failure_id, capsule_id, source, budget) "
+                                   "VALUES ($1, $2, 'starting', $3) RETURNING id",
+                                   f["id"], cid, {"steps": MAX_STEPS, "sims": MAX_SIMS,
+                                                  "min_robustness": MIN_ROBUSTNESS})
+            await log_event(c, "investigation.started", {"investigation": inv, "failure": f["id"], "capsule": cid},
+                            run_id=f["run_id"], tick=f["tick"], robot_id=f["robot_id"])
+        rt.hub.publish("investigation", {"id": inv, "failure_id": f["id"], "capsule_id": cid, "status": "running"})
+        assert rt.lab is not None
+        investigation = Investigation(rt.settings, rt.lab, cid, ctx, DbRecorder(rt, inv, f["id"], cid))
+        try:
+            report = await investigation.run()
+        except Exception as exc:
+            log.exception("investigation %s", inv)
+            async with rt.pool.acquire() as c:
+                await c.execute("UPDATE investigations SET status = 'error', error = $2, finished_at = now() "
+                                "WHERE id = $1", inv, f"{type(exc).__name__}: {exc}"[:500])
+            rt.hub.publish("investigation", {"id": inv, "failure_id": f["id"], "status": "error"})
+            hyps, source, notes = await diagnosis.diagnose(rt.settings, ctx)
+            return hyps, source, notes + [f"investigation failed: {exc}"], None
+        async with rt.pool.acquire() as c, c.transaction():
+            await c.execute("UPDATE investigations SET status = 'done', source = $2, report = $3, finished_at = now() "
+                            "WHERE id = $1", inv, report["source"], report)
+            await log_event(c, "investigation.done", {
+                "investigation": inv, "failure": f["id"], "capsule": cid, "source": report["source"],
+                "root_cause": report["root_cause"], "fixes": [x["fix"] for x in report["fixes"]],
+                "rejected": [x["fix"] for x in report["rejected"]], "steps": report["steps"],
+                "simulations": report["simulations"], "tokens": report["tokens"]},
+                run_id=f["run_id"], tick=f["tick"], robot_id=f["robot_id"])
+        rt.hub.publish("investigation", {"id": inv, "failure_id": f["id"], "capsule_id": cid, "status": "done",
+                                         "fixes": [x["fix"] for x in report["fixes"]]})
+        hyps = [{"cause": report["root_cause"] or "see the investigation", "fix": x["fix"], "rationale": x["why"],
+                 "evidence": x.get("stress")} for x in report["fixes"]]
+        return hyps, report["source"], report["notes"], inv
 
     # ------------------------------------------------------------ 4-5. trials, regression, gate
 
@@ -291,8 +351,16 @@ class Orchestrator:
             return
         if trial["status"] != "done" or trial["outcome"] != "avoided":
             await self._hyp_status(c, h, "failed", {"passed": False, "trial": trial["outcome"] or "error",
-                                                    "trial_replay": trial["id"]})
+                                                    "trial_replay": trial["id"], **_robustness(h)})
             return
+        if h["investigation_id"] is not None:  # the investigator's fixes must also hold up across variants
+            rob = (h["evidence"] or {}).get("robustness")
+            if rob is None or rob < MIN_ROBUSTNESS:
+                await self._hyp_status(c, h, "failed", {
+                    "passed": False, "trial": "avoided", "trial_replay": trial["id"], **_robustness(h),
+                    "reason": "not stress-tested" if rob is None else
+                    f"only {rob * 100:.0f}% of variants safe (needs {MIN_ROBUSTNESS * 100:.0f}%)"})
+                return
         await self._start_regression(c, capsule_id, h, cur, trial["id"])
 
     async def _start_regression(self, c: asyncpg.Connection, capsule_id: int, h: asyncpg.Record | dict,
@@ -300,7 +368,7 @@ class Orchestrator:
         suite = await c.fetch("SELECT id FROM capsules WHERE in_regression AND id <> $1 ORDER BY id DESC LIMIT $2",
                               capsule_id, SUITE_SIZE)
         gate = {"trial": "avoided", "trial_replay": trial_id, "policy_version": cur["version"],
-                "suite": [s["id"] for s in suite]}
+                "suite": [s["id"] for s in suite], **_robustness(h)}
         if not suite:
             gate.update(passed=True, regression={"passed": 0, "total": 0, "failed": []})
             await self._hyp_status(c, h, "ready", gate)
@@ -349,7 +417,7 @@ class Orchestrator:
             if h is None or h["status"] != "ready":
                 raise WorkflowError("hypothesis changed while approving; try again")
             f = await c.fetchrow("SELECT * FROM failures WHERE id = $1 FOR UPDATE", k["failure_id"])
-            new = await policies.promote(c, h["fix_dsl"], user, k["id"])
+            new = await policies.promote(c, h["fix_dsl"], user, k["id"], self.rt.signer)
             await c.execute("UPDATE hypotheses SET status = 'superseded' WHERE capsule_id = $1 AND id <> $2 "
                             "AND status IN ('trial', 'regression', 'ready')", k["id"], hid)
             await self._hyp_status(c, h, "approved", {**(h["gate"] or {}), "approved_by": user,
@@ -369,7 +437,7 @@ class Orchestrator:
 
     async def push_policy(self, pol: dict) -> None:
         try:
-            await self.rt.sim.policy(pol["version"], list(pol["rules"]))
+            await self.rt.sim.policy(pol["version"], list(pol["rules"]), pol.get("signature"))
             self._last_policy_push = time.monotonic()
         except SimNodeError as exc:
             log.warning("policy push failed, will retry: %s", exc)
