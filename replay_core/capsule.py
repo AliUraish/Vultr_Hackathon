@@ -18,7 +18,7 @@ from .world import MAP_HASH, TICK_HZ
 
 CAPSULE_FORMAT = 1
 PRE_TICKS = 10 * TICK_HZ       # start at least 10 s before the failure...
-MAX_PRE_TICKS = 60 * TICK_HZ   # ...or at the failing job's start, but never more than 60 s back
+MAX_PRE_TICKS = 180 * TICK_HZ  # ...or at the failing load's ticket, but never more than 3 min back
 POST_TICKS = 2 * TICK_HZ       # and run 2 s past it
 # Fix trials keep simulating past the capsule end (no new inputs) so a fix that only
 # delays the failure beyond T+2 s is not mistaken for one that prevents it.
@@ -36,8 +36,8 @@ class CapsuleError(ValueError):
 def window(fail_tick: int, job_start_tick: int | None = None, run_start_tick: int = 0) -> tuple[int, int]:
     """(target start tick, end tick) for a failure at fail_tick.
 
-    Reaching back to the failing job's start matters: a wrong item picked 15 s
-    before the dock scan must be inside the capsule, or no fix can change it.
+    Reaching back to the failing load's ticket matters: wrong material loaded two
+    minutes before the dump scan must be inside the capsule, or no fix can change it.
     """
     start = fail_tick - PRE_TICKS
     if job_start_tick is not None:
@@ -81,8 +81,18 @@ def build(run_id: str, snapshot_state: dict, records: list[dict], failure: dict)
     capsule["hash"] = sha256(core)
     capsule["policy"] = {k: snapshot_state["policy"][k] for k in ("version", "rules", "hash")}
     capsule["baseline_failures"] = [f for r in records for f in detect(r["frame"])]
-    capsule["live_frames"] = [r["frame"] for r in records]
+    capsule["live_frames"] = [compact(r["frame"]) for r in records]
     return capsule
+
+
+def compact(frame: dict) -> dict:
+    """What the replay viewer and the diagnosis read of a live frame (no routes or health: ~10x smaller)."""
+    return {
+        "t": frame["t"],
+        "robots": [{k: r[k] for k in ("id", "x", "y", "v", "dir", "st", "job", "carry")} for r in frame["robots"]],
+        "pallets": frame["pallets"], "potholes": frame.get("potholes", []), "restricted": frame["restricted"],
+        "ev": [e for e in frame["ev"] if e["type"] not in ("cmd", "input_ignored")],
+    }
 
 
 def policy_at(capsule: dict, tick: int) -> list[str]:

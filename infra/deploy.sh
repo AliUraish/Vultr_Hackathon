@@ -10,14 +10,23 @@
 #   infra/deploy.sh reset    wipe all data for a clean demo (asks first)
 #
 # Needs VM_A_IP and VM_B_IP in .env and this machine's SSH key on both VMs (root).
+# TARGET=mining infra/deploy.sh ...   the mine deployment instead: MINING_VM_A_IP / MINING_VM_B_IP,
+# its own secrets file, and Vultr Serverless Inference (VULTR_INFERENCE_KEY_MINING, MINING_INFERENCE_MODEL).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 env_get() { grep -E "^$1=" .env 2>/dev/null | head -1 | cut -d= -f2- | sed 's/[[:space:]]*#.*$//; s/[[:space:]]*$//'; }
-VM_A_IP=$(env_get VM_A_IP); VM_B_IP=$(env_get VM_B_IP)
-: "${VM_A_IP:?set VM_A_IP in .env}" "${VM_B_IP:?set VM_B_IP in .env}"
+if [ "${TARGET:-}" = "mining" ]; then
+  VM_A_IP=$(env_get MINING_VM_A_IP); VM_B_IP=$(env_get MINING_VM_B_IP)
+  SECRETS=infra/.secrets.mining.env
+  INF_PROVIDER=vultr; INF_KEY=$(env_get VULTR_INFERENCE_KEY_MINING); INF_MODEL=$(env_get MINING_INFERENCE_MODEL)
+else
+  VM_A_IP=$(env_get VM_A_IP); VM_B_IP=$(env_get VM_B_IP)
+  SECRETS=infra/.secrets.env
+  INF_PROVIDER=vultr; INF_KEY=$(env_get VULTR_INFERENCE_KEY); INF_MODEL=$(env_get VULTR_INFERENCE_MODEL)
+fi
+: "${VM_A_IP:?set the VM A IP in .env}" "${VM_B_IP:?set the VM B IP in .env}"
 
-SECRETS=infra/.secrets.env
 if [ ! -f "$SECRETS" ]; then
   ( umask 077
     printf 'NODE_TOKEN=%s\nADMIN_PASSWORD=%s\n' "$(openssl rand -hex 24)" "$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 16)" > "$SECRETS" )
@@ -30,7 +39,7 @@ SSH=(ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
 
 push_code() {
   rsync -az --delete -e "${SSH[*]}" \
-    --exclude .venv --exclude .git --exclude .env --exclude 'infra/.secrets.env' \
+    --exclude .venv --exclude .git --exclude .env --exclude 'infra/.secrets*.env' --exclude .gstack \
     --exclude __pycache__ --exclude .pytest_cache --exclude '*.pyc' \
     ./ "root@$1:/opt/replay/"
 }
@@ -44,8 +53,7 @@ case "${1:-}" in
     echo "== VM A ($VM_A_IP): control plane + Postgres"
     push_code "$VM_A_IP"
     printf 'NODE_TOKEN=%s\nADMIN_PASSWORD=%s\nVM_B_IP=%s\nINFERENCE_PROVIDER=%s\nINFERENCE_KEY=%s\nINFERENCE_MODEL=%s\n' \
-      "$NODE_TOKEN" "$ADMIN_PASSWORD" "$VM_B_IP" "$(env_get INFERENCE_PROVIDER)" \
-      "$(env_get INFERENCE_KEY)" "$(env_get INFERENCE_MODEL)" | send_env "$VM_A_IP"
+      "$NODE_TOKEN" "$ADMIN_PASSWORD" "$VM_B_IP" "$INF_PROVIDER" "$INF_KEY" "$INF_MODEL" | send_env "$VM_A_IP"
     "${SSH[@]}" "root@$VM_A_IP" 'bash /opt/replay/infra/bootstrap-a.sh'
     echo "== VM B ($VM_B_IP): sim + replay workers"
     push_code "$VM_B_IP"
@@ -100,6 +108,15 @@ case "${1:-}" in
       systemctl start replay-control'
     "${SSH[@]}" "root@$VM_B_IP" 'rm -f /var/lib/replay/witness.jsonl; systemctl restart replay-sim "replay-worker@*"'
     echo "reset: empty database, new site profile, policy v1, empty ledger, new sim run"
+    ;;
+  aienv)  # set AI knobs on VM A, e.g.: infra/deploy.sh aienv AI_BURST_USD=100 AI_TARGET_USD_PER_HOUR=2
+    shift
+    for kv in "$@"; do
+      case "$kv" in AI_*=*|HAZARD_EVERY_S=*|AUTOPILOT=*|INFERENCE_PRICE_*=*) ;; *) echo "not an AI setting: $kv"; exit 1 ;; esac
+      k=${kv%%=*}
+      "${SSH[@]}" "root@$VM_A_IP" "sed -i '/^$k=/d' /etc/replay/control.env && echo '$kv' >> /etc/replay/control.env"
+    done
+    "${SSH[@]}" "root@$VM_A_IP" 'systemctl restart replay-control && grep -E "^(AI_|HAZARD|AUTOPILOT)" /etc/replay/control.env'
     ;;
   status)
     "${SSH[@]}" "root@$VM_A_IP" 'systemctl is-active replay-control postgresql; curl -s localhost:8000/healthz; echo'

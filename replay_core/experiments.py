@@ -4,11 +4,11 @@ Every experiment is a deterministic simulation derived from a capsule, so every
 number the investigator reports can be re-run and gets the same answer.
 
   variant   the incident's situation re-created with a twist: the hazard placed at
-            a different gap, time, robot or aisle, and/or new random pick/drop
+            a different gap, time, truck or bench road, and/or new random load/dump
             timings; run under an explicit policy
   stress    a fix against N variants: of the variants where the hazard causes the
             failure under the current policy, how many does the fix prevent, and
-            what does it cost in distance travelled and jobs completed
+            what does it cost in distance hauled and loads completed
   isolate   delta debugging (ddmin) over the recorded inputs: the smallest set of
             events that still reproduces the failure
 """
@@ -24,16 +24,16 @@ from .frames import ui_frame
 from .hashing import clone
 from .policy import PolicyError, make_policy, parse_rule
 from .rng import seed_state
-from .scenarios import reinject_hints, resolve
+from .scenarios import BENCH_SEGMENTS, reinject_hints, resolve
 from .world import TICK_HZ, W
 
-HAZARD = {"collision": "pallet_drop", "wrong_item": "mislabel_bin", "zone_breach": "worker_in_aisle"}
-AFTER = {"collision": 20 * TICK_HZ, "wrong_item": 90 * TICK_HZ, "zone_breach": 30 * TICK_HZ}
+HAZARD = {"collision": "rockfall", "wrong_item": "grade_mixup", "zone_breach": "blast_closure"}
+AFTER = {"collision": 20 * TICK_HZ, "wrong_item": 180 * TICK_HZ, "zone_breach": 40 * TICK_HZ}
 DEFAULT_AFTER = 40 * TICK_HZ
 PLACE_WITHIN = 40 * TICK_HZ   # a hazard that finds no robot in position within 40 s leaves the variant unplaced
 ISOLATE_TAIL = 10 * TICK_HZ
 SPREAD = 12 * TICK_HZ         # variants place the hazard up to 12 s before or after the original
-AISLES = tuple(sorted(z for z in W.zones if z.startswith("aisle_")))
+AISLES = BENCH_SEGMENTS + ("cuts",)   # where rocks come off a highwall
 
 
 # ------------------------------------------------------------------ describing things for people
@@ -43,12 +43,12 @@ def describe_input(t: int, i: dict) -> str:
     if kind == "cmd":
         job = i.get("job") or {}
         picks = [s.get("slot") for s in i.get("steps", []) if s.get("op") == "pick"]
-        return f"t{t}: job {job.get('id', '?')} → {i.get('robot')} (pick {', '.join(picks) or '–'} → {job.get('dock', '?')})"
+        return f"t{t}: load {job.get('id', '?')} → {i.get('robot')} (face {', '.join(picks) or '–'} → {job.get('dock', '?')})"
     if kind == "chaos":
         where = i.get("cell") or i.get("slot") or i.get("zone") or ""
         if isinstance(where, list):
             where = f"c{where[0]}_{where[1]}"
-        extra = f", {i['gap_mm']} mm ahead of {i.get('target')}" if isinstance(i.get("gap_mm"), int) else ""
+        extra = f", {i['gap_mm'] / 1000:.0f} m ahead of {i.get('target')}" if isinstance(i.get("gap_mm"), int) else ""
         return f"t{t}: {i.get('type')} {where}{extra}"
     return f"t{t}: {kind} {i.get('robot', '')}".strip()
 
@@ -59,14 +59,14 @@ def describe_variant(v: dict) -> str:
     if hz:
         h = hz["hints"]
         if "gap_mm" in h:
-            parts.append(f"pallet {h['gap_mm']} mm ahead")
+            parts.append(f"rock {h['gap_mm'] / 1000:.0f} m ahead")
         if "zone" in h:
-            parts.append(f"in {h['zone']}")
+            parts.append(f"on {h['zone']}")
         if "cls" in h:
-            parts.append(f"{h['cls']} bin")
+            parts.append(f"{h['cls']} face")
         parts.append(f"at t{hz['at']}")
     if v.get("reseed"):
-        parts.append("new pick timings")
+        parts.append("new load timings")
     return ", ".join(parts) or "as recorded"
 
 
@@ -100,10 +100,10 @@ def make_variants(capsule: dict, n: int, seed: int = 0) -> list[dict]:
     for i in range(1, n):
         v: dict[str, Any] = {"id": i, "reseed": rng.randrange(1, 2**31) if rng.random() < 0.7 else None}
         hints: dict[str, Any] = {}
-        if ftype == "collision":  # mostly other aisles, so a fix scoped to the incident's aisle is caught out
+        if ftype == "collision":  # mostly other bench roads, so a fix scoped to the incident's bench is caught out
             r = rng.random()
-            zone = rng.choice(AISLES) if r < 0.6 else "racks" if r < 0.85 else base.get("zone", "racks")
-            hints = {"min_v": 1, "zone": zone, "gap_mm": rng.randint(160, 440)}
+            zone = rng.choice(AISLES) if r < 0.6 else "benches" if r < 0.85 else base.get("zone", "benches")
+            hints = {"min_v": 1, "zone": zone, "gap_mm": rng.randint(8_000, 17_000)}
         elif ftype == "wrong_item" and "cls" in base and rng.random() < 0.7:
             hints = {"cls": base["cls"]}
         elif ftype == "zone_breach" and "zone" in base and rng.random() < 0.4:
@@ -116,10 +116,42 @@ def make_variants(capsule: dict, n: int, seed: int = 0) -> list[dict]:
     return out
 
 
+_FORKS: dict[tuple[str, int], dict] = {}
+
+
+def fork_tick(capsule: dict) -> int:
+    """Where every variant of this capsule starts: shortly before the earliest a variant places its hazard.
+    Everything before it is the recorded run, identical for all variants, so it is simulated once."""
+    t0, orig = original_hazard(capsule)
+    if not HAZARD.get(capsule["failure"]["type"]) or t0 is None:
+        return capsule["start"]
+    return max(capsule["start"], t0 - SPREAD - 2 * TICK_HZ)
+
+
+def fork_state(capsule: dict, tick: int) -> dict:
+    """The recorded run (recorded policy, recorded inputs minus the original hazard) up to `tick`; cached."""
+    key = (capsule["hash"], tick)
+    if key not in _FORKS:
+        state = clone(capsule["snapshot"])
+        scen = HAZARD.get(capsule["failure"]["type"])
+        inputs_at = {t: ins for t, ins in capsule["inputs"]}
+        for t in range(capsule["start"], tick):
+            ins = [i for i in clone(inputs_at.get(t, [])) if not (i.get("kind") == "chaos" and i.get("scenario") == scen)]
+            step(state, ins)
+        while len(_FORKS) >= 8:
+            _FORKS.pop(next(iter(_FORKS)))
+        _FORKS[key] = state
+    return clone(_FORKS[key])
+
+
 def run_variant(capsule: dict, rules: list[str], variant: dict, keep_frames: bool = False) -> dict[str, Any]:
-    """Run one variant under an explicit policy. Returns what the stress test needs (and frames if asked)."""
+    """Run one variant under an explicit policy. Returns what the stress test needs (and frames if asked).
+
+    The variant forks from the recorded run just before its hazard window: the policy under test and the
+    variant's new load timings take effect there, the hazard is placed inside the window."""
     ftype = capsule["failure"]["type"]
-    state = clone(capsule["snapshot"])
+    start = fork_tick(capsule)
+    state = fork_state(capsule, start)
     set_policy(state, make_policy(rules, 0), [])
     if variant.get("reseed"):
         state["rng"] = seed_state(variant["reseed"])
@@ -127,6 +159,8 @@ def run_variant(capsule: dict, rules: list[str], variant: dict, keep_frames: boo
     scen = hz["scenario"] if hz else None
     inputs_at: dict[int, list] = {}
     for t, ins in capsule["inputs"]:
+        if t < start:
+            continue
         keep = [i for i in ins if i.get("kind") != "policy"
                 and not (hz and i.get("kind") == "chaos" and i.get("scenario") == scen)]
         if keep:
@@ -138,7 +172,7 @@ def run_variant(capsule: dict, rules: list[str], variant: dict, keep_frames: boo
     failures: list[dict] = []
     frames: list[dict] = []
     jobs = wait = 0
-    t = capsule["start"]
+    t = start
     while True:
         ins = clone(inputs_at.get(t, []))
         if hz and fired_at is None and hz["at"] <= t < hz["at"] + PLACE_WITHIN:
@@ -150,7 +184,7 @@ def run_variant(capsule: dict, rules: list[str], variant: dict, keep_frames: boo
         frame = make_frame(state, events, ins)
         failures.extend(detect(frame))
         jobs += sum(1 for e in events if e["type"] == "job_done" and e.get("ok"))
-        wait += sum(1 for r in frame["robots"] if r["st"] in ("waiting", "blocked", "held"))
+        wait += sum(1 for r in frame["robots"] if r["st"] in ("waiting", "blocked", "held", "queued"))
         if keep_frames:
             frames.append(ui_frame(frame, with_paths=False))
         t += 1
@@ -164,7 +198,7 @@ def run_variant(capsule: dict, rules: list[str], variant: dict, keep_frames: boo
             break
         if t > capsule["end"] + 4000:
             break
-    since = fired_at if hz else capsule["start"]
+    since = fired_at if hz else start
     relevant = [f for f in failures if since is not None and f["tick"] > since]
     hits = [f for f in relevant if f["type"] == ftype]
     latent = False
@@ -184,7 +218,7 @@ def run_variant(capsule: dict, rules: list[str], variant: dict, keep_frames: boo
         "jobs": jobs,
         "dist_m": round((sum(r["odo"] for r in state["robots"].values()) - dist0) / 1000, 1),
         "wait_s": round(wait / TICK_HZ, 1),
-        "ticks": t - capsule["start"],
+        "ticks": t - start,
         **({"frames": frames} if keep_frames else {}),
     }
 
@@ -250,12 +284,12 @@ def aggregate(variants: list[dict], baseline: list[dict], candidate: list[dict])
 
 # ------------------------------------------------------------------ tuning
 
-TUNABLE = {"speed_cap": (1, [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1]),
-           "min_clearance": (0, [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8])}
+TUNABLE = {"speed_cap": (1, [10, 15, 20, 25, 30, 35, 40]),                 # km/h
+           "min_clearance": (0, [2, 4, 6, 8, 12, 16, 24])}                 # metres
 
 
 def sweep(fix: str, values: list[float] | None = None) -> list[str]:
-    """The same fix at a range of settings: speed_cap(racks, 0.6) -> speed_cap(racks, 0.3) .. (racks, 1.1)."""
+    """The same fix at a range of settings: speed_cap(benches, 20) -> speed_cap(benches, 10) .. (benches, 40)."""
     rule = parse_rule(fix)
     if rule.name not in TUNABLE:
         raise PolicyError(f"{rule.name} has no numeric setting to tune; tunable: {', '.join(TUNABLE)}")
@@ -286,8 +320,8 @@ def pick_setting(points: list[dict], min_robustness: float) -> dict | None:
 def _reproduces(capsule: dict, allowed: set[tuple[int, int]]) -> bool:
     """Replay with the recorded policy but only the allowed (tick, index) inputs; does the failure recur?
 
-    "The failure" means the same kind of failure by any robot: with fewer jobs a different
-    robot may be the one that drives into the pallet, and that is still the same incident."""
+    "The failure" means the same kind of failure by any truck: with fewer loads a different
+    truck may be the one that drives into the rock, and that is still the same incident."""
     target = capsule["failure"]
     state = clone(capsule["snapshot"])
     inputs_at: dict[int, list] = {}
@@ -352,7 +386,7 @@ def isolate(capsule: dict, budget: int = 90) -> dict[str, Any]:
                for t, idx in cur]
     if len(minimal) == len(elems):
         summary = (f"all {len(elems)} recorded events are needed: the failure depends on the exact timing of "
-                   "every robot's job, so it is a physics/timing problem, not one bad input")
+                   "every truck's load, so it is a physics/timing problem, not one bad input")
     else:
         summary = f"{len(minimal)} of {len(elems)} recorded events are enough to cause it"
     return {"ok": True, "minimal": minimal, "tested": tests, "total": len(elems), "trace": trace,

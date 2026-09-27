@@ -2,12 +2,12 @@
 
 A policy is an ordered list of rules. Each rule is one fix from a closed set:
 
-    speed_cap(<zone>, <m/s>)            max speed inside a zone
+    speed_cap(<zone>, <km/h>)           max speed inside a zone
     min_clearance(<m>)                  distance kept to sensed obstacles
     reroute_avoid(<zone> | c<x>_<y>)    path planner avoids these cells when it can
-    reorder_steps(<job kind>, <strategy>)  pick order for jobs of a kind
-    require_scan_confirm(<item class> | *) scan the bin before picking
-    respect_closures(<zone> | *)        re-plan when a zone closes; never drive into a closed zone
+    reorder_steps(<job kind>, <strategy>)  order of the loads in a multi-face job
+    grade_check(<material> | *)         check the material grade at the face before loading
+    respect_closures(<zone> | *)        re-plan when a zone closes (blasting); never drive into a closed zone
 
 Rules from the diagnosis agent are parsed and validated here before anything
 runs them; nothing in a rule is ever evaluated as code.
@@ -22,7 +22,7 @@ from .hashing import sha256
 from .world import DEFAULT_CLEARANCE, ITEM_CLASSES, MAX_SPEED, TICK_HZ, W
 
 FIX_TYPES: tuple[str, ...] = (
-    "speed_cap", "min_clearance", "reroute_avoid", "reorder_steps", "require_scan_confirm",
+    "speed_cap", "min_clearance", "reroute_avoid", "reorder_steps", "grade_check",
     "respect_closures",
 )
 JOB_KINDS: tuple[str, ...] = ("single", "multi", "*")
@@ -31,10 +31,10 @@ STRATEGIES: tuple[str, ...] = ("nearest_first", "farthest_first", "as_given")
 _RULE_RE = re.compile(r"^\s*([a-z_]+)\s*\((.*)\)\s*$")
 _CELL_RE = re.compile(r"^c(\d+)_(\d+)$")
 
-MIN_SPEED_MPS = Decimal("0.1")
-MAX_SPEED_MPS = Decimal(MAX_SPEED * TICK_HZ) / 1000
-MIN_CLEARANCE_M = Decimal("0.05")
-MAX_CLEARANCE_M = Decimal("1.0")
+MIN_SPEED_KMH = Decimal("5")
+MAX_SPEED_KMH = Decimal("45")
+MIN_CLEARANCE_M = Decimal("1")
+MAX_CLEARANCE_M = Decimal("40")
 
 
 class PolicyError(ValueError):
@@ -61,8 +61,7 @@ def _number(text: str, lo: Decimal, hi: Decimal, what: str) -> Decimal:
 
 
 def _fmt(value: Decimal) -> str:
-    text = format(value.normalize(), "f")
-    return text if "." in text else f"{text}.0"
+    return format(value.normalize(), "f")   # 20, 7.5 (km/h and metres read best without a trailing .0)
 
 
 def _target_cells(arg: str) -> list[list[int]]:
@@ -97,7 +96,7 @@ def parse_rule(text: str) -> Rule:
         need(2)
         if args[0] not in W.zones:
             raise PolicyError(f"unknown zone {args[0]!r}; zones: {', '.join(sorted(W.zones))}")
-        v = _number(args[1], MIN_SPEED_MPS, MAX_SPEED_MPS, "speed (m/s)")
+        v = _number(args[1], MIN_SPEED_KMH, MAX_SPEED_KMH, "speed (km/h)")
         return Rule(name, (args[0], _fmt(v)))
     if name == "min_clearance":
         need(1)
@@ -119,9 +118,9 @@ def parse_rule(text: str) -> Rule:
         if args[0] != "*" and args[0] not in W.zones:
             raise PolicyError(f"zone must be * or one of {', '.join(sorted(W.zones))}")
         return Rule(name, args)
-    need(1)  # require_scan_confirm
+    need(1)  # grade_check
     if args[0] != "*" and args[0] not in ITEM_CLASSES:
-        raise PolicyError(f"item class must be * or one of {', '.join(ITEM_CLASSES)}")
+        raise PolicyError(f"material must be * or one of {', '.join(ITEM_CLASSES)}")
     return Rule(name, args)
 
 
@@ -141,7 +140,7 @@ def compile_rules(rules: list[str]) -> dict:
         rule = parse_rule(text)
         a = rule.args
         if rule.name == "speed_cap":
-            mm_per_tick = int(Decimal(a[1]) * 1000 / TICK_HZ)
+            mm_per_tick = int(Decimal(a[1]) * 1_000_000 / 3600 / TICK_HZ)   # km/h -> mm per tick
             caps[a[0]] = min(caps.get(a[0], MAX_SPEED), mm_per_tick)
         elif rule.name == "min_clearance":
             clearance = max(clearance, int(Decimal(a[0]) * 1000))
