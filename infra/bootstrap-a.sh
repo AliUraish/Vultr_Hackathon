@@ -37,7 +37,7 @@ fi
 
 python3 -m venv "$APP/.venv"
 "$APP/.venv/bin/pip" install -q --upgrade pip
-"$APP/.venv/bin/pip" install -q "fastapi>=0.115" "uvicorn[standard]>=0.30" "asyncpg>=0.29" "httpx>=0.27"
+"$APP/.venv/bin/pip" install -q "fastapi>=0.115" "uvicorn[standard]>=0.30" "asyncpg>=0.29" "httpx>=0.27" "cryptography>=42"
 
 [ -f /etc/replay/session.secret ] || { openssl rand -hex 32 > /etc/replay/session.secret; chmod 600 /etc/replay/session.secret; }
 umask 027

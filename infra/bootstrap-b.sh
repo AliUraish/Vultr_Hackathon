@@ -26,7 +26,7 @@ install -d -m 750 -o root -g replay /etc/replay
 
 python3 -m venv "$APP/.venv"
 "$APP/.venv/bin/pip" install -q --upgrade pip
-"$APP/.venv/bin/pip" install -q "fastapi>=0.115" "uvicorn[standard]>=0.30" "httpx>=0.27"
+"$APP/.venv/bin/pip" install -q "fastapi>=0.115" "uvicorn[standard]>=0.30" "httpx>=0.27" "cryptography>=42"
 
 umask 027
 cat > /etc/replay/sim.env <<CONF
