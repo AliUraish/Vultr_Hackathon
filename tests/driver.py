@@ -8,15 +8,15 @@ from replay_core.detector import detect
 from replay_core.dispatch import choose_robot, make_cmd, make_job
 from replay_core.engine import make_frame
 from replay_core.live import LiveSim
-from replay_core.world import W
+from replay_core.world import DESTINATION, W
 
 
 class Driver:
     def __init__(self, seed: int, rules: list[str] | None = None, job_seed: int = 1,
-                 max_open: int = 4) -> None:
+                 per_face: int = 2) -> None:
         self.sim = LiveSim(seed, rules)
         self.rng = random.Random(job_seed)
-        self.max_open = max_open
+        self.per_face = per_face
         self.records: list[dict] = []
         self.snapshots: dict[int, dict] = {}
         self.pending: list[dict] = []
@@ -27,16 +27,19 @@ class Driver:
         self.frame = make_frame(self.sim.state, [], [])
         self._n = 0
 
-    def _new_job(self) -> dict:
+    def _new_job(self, slot: str) -> dict:
         self._n += 1
-        # heavy (rack F) picks are rare: only one robot can lift them
-        pool = [s for s in sorted(W.slots) if not s.startswith("F") or self.rng.random() < 0.08]
-        slots = self.rng.sample(pool, self.rng.choice([1, 1, 1, 2]))
-        return make_job(f"J{self._n}", slots, self.rng.choice(sorted(W.docks)), self.sim.tick_no)
+        return make_job(f"J{self._n}", [slot], DESTINATION[W.slots[slot]["cls"]], self.sim.tick_no)
 
     def dispatch(self) -> None:
-        while len(self.pending) + len(self.open) < self.max_open:
-            self.pending.append(self._new_job())
+        """Every dig face keeps up to `per_face` load tickets open (one loading, one on its way)."""
+        face = {j: s for j, s in self.face.items()} if hasattr(self, "face") else {}
+        self.face = face
+        for slot in sorted(W.slots):
+            while sum(1 for j in list(self.open) + [p["id"] for p in self.pending] if face.get(j) == slot) < self.per_face:
+                job = self._new_job(slot)
+                face[job["id"]] = slot
+                self.pending.append(job)
         taken: set[str] = set()
         for job in list(self.pending):
             rid = choose_robot(self.frame, job, taken)

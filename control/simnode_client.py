@@ -37,6 +37,15 @@ class SimNode:
     async def service(self, robot: str, op: str, cell: list[int] | None = None, by: str = "") -> dict:
         return await self._post("/fleet/service", {"robot": robot, "op": op, "cell": cell, "by": by})
 
+    async def traffic(self, robot: str, to: str, reason: str = "", by: str = "") -> dict:
+        return await self._post("/fleet/traffic", {"robot": robot, "to": to, "op": "yield", "reason": reason, "by": by})
+
+    async def advice(self, robot: str, cap: int, ttl: int = 150, reason: str = "", by: str = "") -> dict:
+        return await self._post("/fleet/advice", {"robot": robot, "cap": cap, "ttl": ttl, "reason": reason, "by": by})
+
+    async def road(self, fid: str, crew: str = "", by: str = "") -> dict:
+        return await self._post("/fleet/road", {"id": fid, "op": "repair", "crew": crew, "by": by})
+
     async def witness(self, block: dict) -> dict:
         return await self._post("/fleet/witness", {k: block[k] for k in ("n", "hash", "merkle_root", "prev_hash",
                                                                         "events")})

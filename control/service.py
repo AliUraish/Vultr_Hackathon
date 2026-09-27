@@ -1,20 +1,21 @@
-"""Trailer service cases: a robot faults on the floor and the copilot runs the recovery.
+"""Truck service cases: a haul truck faults in the pit and the copilot runs the recovery.
 
-    detected    the robot safety-stopped and raised an alarm (the ping on the floor)
-    safing      the copilot picks a safe cell (left/right of the lane first; out of an aisle if it is
-                boxed in by racks) from cells the rules offer, and drives it there at limp speed
-    diagnosing  the copilot reads the health telemetry (tire pressures, wheel slip, drive current,
+    detected    the truck safety-stopped and raised an alarm (the ping in the pit); the crew is paged:
+                "T04 is not working. Please fix it."
+    safing      the copilot picks a safe spot (beside the road first; off a one-lane bench if it is
+                blocking one) from spots the rules offer, and drives it there at limp speed
+    diagnosing  the copilot reads the health telemetry (tyre pressures, wheel slip, drive current,
                 vibration, lidar) and names the fault; a rule reading is kept alongside as a check
   sensor fault (it can still drive):
-    recovering  the copilot takes remote control, drives it to a free garage bay and deploys the spare
-    in_repair   a technician recalibrates it in the bay; it becomes the new standby trailer
-  tire fault (it can't drive):
-    dispatched  the copilot assigns a technician from the floor team with a work order; they walk over
-    repairing   the technician replaces the tire and marks the job done; the robot rejoins the fleet
+    recovering  the copilot takes remote control, drives it to a free workshop bay and deploys the spare
+    in_repair   a fitter recalibrates it in the bay; it becomes the new standby truck
+  tyre fault (it can't drive):
+    dispatched  the copilot assigns a tyre fitter from the crew with a work order; they drive out to it
+    repairing   the fitter changes the tyre and marks the job done; the truck rejoins the fleet
     resolved
 
-The model decides; the rules validate every decision (only offered cells, only real technicians, a
-tire fault is never driven); the deterministic sim executes it. Every step lands on the case and in
+The model decides; the rules validate every decision (only offered spots, only real crew members, a
+tyre fault is never driven); the deterministic sim executes it. Every step lands on the case and in
 the event log, and the model can be switched off without breaking the pipeline.
 """
 from __future__ import annotations
@@ -39,16 +40,17 @@ from .runtime import Runtime
 log = logging.getLogger("replay.service")
 
 OPEN = ("detected", "safing", "diagnosing", "recovering", "in_repair", "dispatched", "repairing")
-WALK_MPS = 1.3
-TIRE_REPAIR_S = 18
+UTE_CELLS_PER_S = 0.6       # fitters drive out in a service ute: 12 m/s on the haul roads
+TIRE_REPAIR_S = 20
 SENSOR_REPAIR_S = 14
-TOOL_CRIB = (4, 11)          # where technicians start, next to the garage bays
-LANES = ("aisle_", "cross_mid", "dock_area")
-ACTIVE_TARGET = 4            # trailers the site plans to have working
-NOMINAL = {"tire_psi": "85-91", "slip_pct": "< 5 (moving)", "drive_imbalance_pct": "< 6",
-           "vibration_g": "< 0.2", "lidar_returns_pct": "> 95", "lidar_range_mm": 800}
+TOOL_CRIB = (27, 19)         # where the fitters start, outside the workshop
+LANES = ("bench_", "cuts", "crest_road", "middle_road", "pit_floor", "ramp_", "dump_area")
+ACTIVE_TARGET = 8            # trucks the mine plans to have hauling
+NOMINAL = {"tire_psi": "100-110", "slip_pct": "< 5 (moving)", "drive_imbalance_pct": "< 6",
+           "vibration_g": "< 0.2", "lidar_returns_pct": "> 95", "lidar_range_mm": 60000}
 _DIRS = {"E": (1, 0), "W": (-1, 0), "S": (0, 1), "N": (0, -1)}
-_WHEEL = {"FL": "front-left", "FR": "front-right", "RL": "rear-left", "RR": "rear-right"}
+_WHEEL = {"FL": "front-left", "FR": "front-right", "RL1": "rear-left outer", "RL2": "rear-left inner",
+          "RR1": "rear-right outer", "RR2": "rear-right inner"}
 
 
 # ---------------------------------------------------------------- pure helpers (tested)
@@ -62,8 +64,8 @@ def is_lane(c: tuple[int, int]) -> bool:
 
 
 def safe_cells(frame: dict, rid: str, max_steps: int = 4) -> list[dict]:
-    """Cells the robot could pull over to: reachable in a few cells, not reserved or planned by another
-    robot, no pallet, not a dock; scored so left/right of the lane and off the traffic lanes win."""
+    """Spots the truck could pull over to: reachable in a few segments, not reserved or planned by another
+    truck, no rock, not a loading or tipping pocket; scored so beside the road and off the one-lane benches win."""
     me = next(r for r in frame["robots"] if r["id"] == rid)
     start = cell_of(me)
     dx, dy = _DIRS.get(me.get("dir") or "E", (1, 0))
@@ -77,7 +79,7 @@ def safe_cells(frame: dict, rid: str, max_steps: int = 4) -> list[dict]:
                 routes[tuple(c)] = routes.get(tuple(c), 0) + 1
     pallets = {tuple(p["cell"]) for p in frame.get("pallets", [])}
     closed = {tuple(c) for z in frame.get("restricted", []) for c in W.zones.get(z["zone"], [])}
-    docks = {tuple(c) for c in W.docks.values()}
+    docks = set(W.pockets)   # loading and tipping pockets stay clear for the fleet
     seen, frontier, out = {start: 0}, [start], []
     while frontier:
         nxt = []
@@ -94,11 +96,12 @@ def safe_cells(frame: dict, rid: str, max_steps: int = 4) -> list[dict]:
                 off = (n[0] - start[0], n[1] - start[1])
                 side = ("left" if off == left else "right" if off == right else "ahead" if off == (dx, dy)
                         else "behind" if off == (-dx, -dy) else "nearby")
-                lane = is_lane(n)
+                lane = any(z.startswith(("bench_", "cuts")) for z in W.cell_zones.get(n, ()))   # one-lane: blocks everyone
                 score = seen[n] * 2 + (6 if lane else 0) + routes.get(n, 0) * 4 + (0 if side in ("left", "right") else 1.5)
-                out.append({"id": f"c{n[0]}_{n[1]}", "cell": [n[0], n[1]], "side": side, "cells_away": seen[n],
-                            "traffic_lane": lane, "other_robot_routes": routes.get(n, 0),
-                            "zone": [z for z in W.cell_zones.get(n, ()) if z != "racks"] or ["open floor"], "score": score})
+                out.append({"id": f"c{n[0]}_{n[1]}", "cell": [n[0], n[1]], "side": side, "segments_away": seen[n],
+                            "one_lane_road": lane, "other_truck_routes": routes.get(n, 0),
+                            "zone": [z for z in W.cell_zones.get(n, ()) if z not in ("haul_roads", "ramps", "benches")] or ["road"],
+                            "score": score})
         frontier = nxt
     out.sort(key=lambda x: (x["score"], x["id"]))
     return out[:6]
@@ -112,13 +115,13 @@ def read_health(h: dict | None) -> dict:
     low = sorted((p, w) for w, p in tires.items() if p < 60)
     if low or h.get("slip", 0) > 12 or h.get("imbalance", 0) > 20:
         w = low[0][1] if low else min(tires, key=tires.get) if tires else "FL"
-        ev = [f"{_WHEEL.get(w, w)} tire {tires.get(w)} psi (others {', '.join(str(p) for k, p in sorted(tires.items()) if k != w)})",
+        ev = [f"{_WHEEL.get(w, w)} tyre {tires.get(w)} psi (others {', '.join(str(p) for k, p in sorted(tires.items()) if k != w)})",
               f"wheel slip {h.get('slip')}%", f"drive current imbalance {h.get('imbalance')}%", f"vibration {h.get('vib')} g"]
-        return {"fault": "tire", "component": f"{_WHEEL.get(w, w)} drive tire", "movable": False, "evidence": ev}
-    if h.get("lidar", 100) < 70 or h.get("range", 800) < 800:
+        return {"fault": "tire", "component": f"{_WHEEL.get(w, w)} tyre", "movable": False, "evidence": ev}
+    if h.get("lidar", 100) < 70 or h.get("range", 60000) < 60000:
         return {"fault": "sensor", "component": "front lidar", "movable": True,
-                "evidence": [f"lidar returns {h.get('lidar')}%", f"usable range {h.get('range')} mm of 800",
-                             f"tires nominal ({', '.join(str(p) for p in tires.values())} psi)"]}
+                "evidence": [f"lidar returns {h.get('lidar')}%", f"usable range {h.get('range', 0) / 1000:.0f} m of 60",
+                             f"tyres nominal ({', '.join(str(p) for p in tires.values())} psi)"]}
     return {"fault": "unknown", "component": "", "movable": False, "evidence": ["all readings nominal"]}
 
 
@@ -128,7 +131,7 @@ def walk_route(start: tuple[int, int], goal: tuple[int, int], frame: dict) -> li
 
 
 def beside(frame: dict, target: tuple[int, int]) -> tuple[int, int]:
-    """Where a technician stands to work on a robot: a free floor cell next to it."""
+    """Where a fitter parks to work on a truck: a free road segment next to it."""
     robots = {cell_of(o) for o in frame["robots"]}
     for ddx, ddy in ((0, 1), (0, -1), (1, 0), (-1, 0)):
         n = (target[0] + ddx, target[1] + ddy)
@@ -146,22 +149,22 @@ DIAGNOSE = obj({"fault": {"type": "string", "enum": ["tire", "sensor", "unknown"
 RECOVER = obj({"bay": {"type": "string"}, "deploy_spare": {"type": "boolean"}, "technician": {"type": "string"},
                "work_order": {"type": "string"}, "note": {"type": "string"}})
 
-I_PULL = """You are the fleet copilot for a robotic fulfilment centre. A trailer just raised a hardware alarm and
-safety-stopped where it was, possibly blocking a traffic lane. Choose where it should pull over, from the
-candidate cells offered (they are all free and reachable). Prefer: a cell to its left or right, off the traffic
-lanes (aisles, cross aisle, dock lane), not on other robots' planned routes, and as few cells away as possible,
-because the robot may be damaged and will crawl. Answer with the candidate id and one sentence of reasoning."""
+I_PULL = """You are the fleet copilot of an open-pit mine run by autonomous haul trucks. A truck just raised a
+hardware alarm and safety-stopped where it was, possibly blocking a road. Choose where it should pull over, from the
+candidate spots offered (they are all free and reachable). Prefer: a spot to its left or right, off the one-lane bench
+roads and cuts (a truck parked there blocks everyone), not on other trucks' planned routes, and as few segments away
+as possible, because the truck may be damaged and will crawl. Answer with the candidate id and one sentence."""
 
-I_DIAG = """You are the fleet copilot diagnosing a trailer's hardware alarm from its health telemetry.
-Readings: four tire pressures (psi), wheel slip (%), drive current imbalance between wheels (%), chassis vibration (g),
-lidar return rate (%) and usable lidar range (mm); nominal ranges are given. Name the fault (tire or sensor),
-the component, whether the robot can safely drive itself to the garage (a damaged tire cannot; a degraded
-sensor can, slowly, under remote control), your confidence, the evidence readings, and one or two sentences."""
+I_DIAG = """You are the fleet copilot diagnosing a haul truck's hardware alarm from its health telemetry.
+Readings: six tyre pressures (psi; the rears are duals), wheel slip (%), drive current imbalance between wheels (%),
+chassis vibration (g), lidar return rate (%) and usable lidar range (mm); nominal ranges are given. Name the fault
+(tire or sensor), the component, whether the truck can safely drive itself to the workshop (a damaged tyre cannot;
+a degraded lidar can, slowly, under remote control), your confidence, the evidence readings, and one or two sentences."""
 
-I_RECOVER = """You are the fleet copilot planning a trailer's recovery. If the fault is a sensor, the robot can drive:
-pick a free garage bay for it and decide whether to deploy the standby trailer so the fleet keeps its capacity.
-If it is a tire, the robot stays where it is: pick the technician from the floor team (use the maintenance
-technician if there is one) and write a short, specific work order. Fields that don't apply: bay "none",
+I_RECOVER = """You are the fleet copilot planning a haul truck's recovery. If the fault is a sensor, the truck can drive:
+pick a free workshop bay for it and decide whether to deploy the standby truck so the fleet keeps hauling.
+If it is a tyre, the truck stays where it is: pick the person from the crew (the tyre fitter if there is one, else
+the maintenance fitter) and write a short, specific work order. Fields that don't apply: bay "none",
 technician "none", deploy_spare false. Keep the note to one sentence."""
 
 
@@ -192,6 +195,10 @@ class ServiceDesk:
 
     async def _save(self, case: dict, status: str, step: dict | None = None, **fields: Any) -> dict:
         steps = list(case["steps"]) + ([{"at": time.time(), "status": status, **step}] if step else [])
+        if step and step.get("by") in ("copilot", "rules"):   # the decision feed on the live pit
+            self.rt.decide({"kind": "service", "phase": "done", "robot": case["robot_id"], "case": case["id"],
+                            "status": status, "title": step.get("title"), "reason": step.get("detail"),
+                            "by": "ai" if step.get("by") == "copilot" else "rules", "source": step.get("model", "rules")})
         sets = {"status": status, "steps": steps, **fields}
         cols = ", ".join(f"{k} = ${i + 2}" for i, k in enumerate(sets))
         async with self.rt.pool.acquire() as c, c.transaction():
@@ -215,7 +222,7 @@ class ServiceDesk:
                 return
             step = {"at": time.time(), "status": "detected", "title": f"{rid} raised {ev.get('code')}",
                     "detail": f"safety stop at c{ev['cell'][0]}_{ev['cell'][1]}"
-                              + (f"; job {ev['job']} handed back to the fleet" if ev.get("job") else ""), "by": "robot"}
+                              + (f"; load {ev['job']} handed back to the fleet" if ev.get("job") else ""), "by": "robot"}
             row = await c.fetchrow(
                 "INSERT INTO service_cases (run_id, robot_id, tick, code, status, steps, job_released, start_cell) "
                 "VALUES ($1, $2, $3, $4, 'detected', $5, $6, $7) RETURNING *",
@@ -223,7 +230,14 @@ class ServiceDesk:
             await log_event(c, "service.opened", {"case": row["id"], "robot": rid, "code": ev.get("code"),
                                                   "cell": ev.get("cell"), "job": ev.get("job")},
                             run_id=run_id, tick=tick, robot_id=rid)
+            message = (f"{rid} is not working ({ev.get('code')}). The copilot is pulling it off the road; "
+                       f"please fix it.")
+            await log_event(c, "service.alert", {"case": row["id"], "robot": rid, "message": message,
+                                                 "to": "shift crew"}, run_id=run_id, tick=tick, robot_id=rid)
         self.rt.hub.publish("service", public(dict(row)))
+        self.rt.hub.publish("alert", {"case": row["id"], "robot": rid, "message": message, "code": ev.get("code")})
+        self.rt.decide({"kind": "service", "phase": "alert", "robot": rid, "case": row["id"], "title": f"{rid} is not working",
+                        "reason": message, "by": "rules"})
         self.kick()
 
     # -- the loop --------------------------------------------------------------
@@ -248,8 +262,8 @@ class ServiceDesk:
                 log.exception("service loop")
 
     async def _keep_capacity(self, open_ids: list[int]) -> None:
-        """Keep four trailers working: if a case left the fleet short and a healthy standby is parked
-        (e.g. one just repaired in the garage), deploy it and record it on the case that needed it."""
+        """Keep the fleet hauling: if a case left it short and a healthy standby is parked (e.g. one just
+        repaired in the workshop), deploy it and record it on the case that needed it."""
         f = self.rt.frame
         if not f or not self.rt.sim_online:
             return
@@ -268,7 +282,7 @@ class ServiceDesk:
                 break
         if case:
             await self._save(case, case["status"], {"title": f"Standby {spare['id']} deployed to restore capacity",
-                                                    "by": "rules", "detail": f"{len(working)} trailers were working; target {ACTIVE_TARGET}"},
+                                                    "by": "rules", "detail": f"{len(working)} trucks were hauling; target {ACTIVE_TARGET}"},
                              spare=spare["id"])
         else:
             async with self.rt.pool.acquire() as c:
@@ -280,7 +294,7 @@ class ServiceDesk:
             case = await self._load(cid)
             if case and case["status"] in OPEN and self.rt.run_id and case["run_id"] != self.rt.run_id:
                 await self._save(case, "closed", {"title": "Closed: the sim restarted", "by": "fleet",
-                                                  "detail": "the robot came back healthy in the new run"})
+                                                  "detail": "the truck came back healthy in the new run"})
             elif case and case["status"] in OPEN:
                 await getattr(self, f"_{case['status']}")(case)
         except Exception:
@@ -311,17 +325,18 @@ class ServiceDesk:
             await self._save(case, "diagnosing", {"title": "Holding in place", "by": "rules",
                                                   "detail": "no free cell within reach; the fleet routes around it"})
             return
-        payload = {"robot": case["robot_id"], "alarm": case["code"], "cell": f"c{cell_of(r)[0]}_{cell_of(r)[1]}",
-                   "heading": r.get("dir"), "zone": [z for z in W.cell_zones.get(cell_of(r), ()) if z != "racks"],
+        payload = {"truck": case["robot_id"], "alarm": case["code"], "at": f"c{cell_of(r)[0]}_{cell_of(r)[1]}",
+                   "heading": r.get("dir"),
+                   "road": [z for z in W.cell_zones.get(cell_of(r), ()) if z not in ("haul_roads", "ramps", "benches")],
                    "candidates": [{k: v for k, v in c.items() if k != "score"} for c in cands],
-                   "other_robots": [{"id": o["id"], "cell": f"c{cell_of(o)[0]}_{cell_of(o)[1]}", "status": o["st"]}
+                   "other_trucks": [{"id": o["id"], "at": f"c{cell_of(o)[0]}_{cell_of(o)[1]}", "status": o["st"]}
                                     for o in self.rt.frame["robots"] if o["id"] != case["robot_id"]]}
         ans, source, tokens = await self._ask(case, I_PULL, payload, PULL_OVER, "pull_over")
         pick = next((c for c in cands if ans and c["id"] == ans.get("candidate")), None)
         by, reason = ("copilot", str(ans.get("reason", ""))[:300]) if pick else ("rules", "")
         if pick is None:
             pick = cands[0]
-            reason = f"best-scored free cell ({pick['side']}, {pick['cells_away']} away, {'on' if pick['traffic_lane'] else 'off'} the traffic lanes)"
+            reason = f"best-scored free spot ({pick['side']}, {pick['segments_away']} segment(s) away, {'on' if pick['one_lane_road'] else 'off'} a one-lane road)"
         await self.rt.sim.service(case["robot_id"], "move", pick["cell"], by)
         await self._save(case, "safing", {"title": f"Pulling over to {pick['id']} ({pick['side']})", "by": by,
                                           "model": source, "detail": reason, "cell": pick["cell"]},
@@ -340,7 +355,7 @@ class ServiceDesk:
         r = self._robot(rid)
         hist = list(self.health.get(rid, []))[-12:] or ([{"t": self.rt.last_tick, **(r.get("health") or {})}] if r else [])
         rules = read_health(hist[-1] if hist else None)
-        payload = {"robot": rid, "alarm": case["code"], "nominal": NOMINAL,
+        payload = {"truck": rid, "alarm": case["code"], "nominal": NOMINAL,
                    "readings": [{"t": h.get("t"), "tires_psi": h.get("tires"), "slip_pct": h.get("slip"),
                                  "drive_imbalance_pct": h.get("imbalance"), "vibration_g": h.get("vib"),
                                  "lidar_returns_pct": h.get("lidar"), "lidar_range_mm": h.get("range"),
@@ -374,46 +389,49 @@ class ServiceDesk:
         bays = [f"G{i + 1}" for i, b in enumerate(W.garage) if b not in occupied]
         spare = next((o for o in frame["robots"] if o.get("svc") == "standby" and not o.get("fault")), None)
         team = (self.rt.site or {}).get("associates", [])
-        payload = {"robot": rid, "diagnosis": diag, "free_garage_bays": bays or ["none"],
-                   "standby_trailer": spare["id"] if spare else None,
-                   "floor_team": [{"name": a["name"], "role": a["role"], "shift": a.get("shift")} for a in team]}
+        payload = {"truck": rid, "diagnosis": diag, "free_workshop_bays": bays or ["none"],
+                   "standby_truck": spare["id"] if spare else None,
+                   "crew": [{"name": a["name"], "role": a["role"], "shift": a.get("shift")} for a in team]}
         ans, source, tokens = await self._ask(case, I_RECOVER, payload, RECOVER, "recover")
         now = time.time()
         if diag["movable"]:
             bay = ans.get("bay") if ans and ans.get("bay") in bays else (bays[0] if bays else None)
             by = "copilot" if ans and ans.get("bay") in bays else "rules"
             if bay is None:
-                await self._save(case, "dispatched", {"title": "No free garage bay: technician comes to it", "by": "rules"})
+                await self._save(case, "dispatched", {"title": "No free workshop bay: the fitter comes to it", "by": "rules"})
                 return await self._send_tech(case, diag, ans, source, tokens)
             cell = list(W.garage[int(bay[1:]) - 1])
             await self.rt.sim.service(rid, "move", cell, "copilot")
             spare_note = ""
             if spare and (ans is None or ans.get("deploy_spare", True)):
                 await self.rt.sim.service(spare["id"], "deploy", None, "copilot")
-                spare_note = f"; standby {spare['id']} deployed to keep four trailers working"
-            await self._save(case, "recovering", {"title": f"Copilot has remote control: driving {rid} to bay {bay}", "by": by,
+                spare_note = f"; standby {spare['id']} deployed to keep the fleet hauling"
+            await self._save(case, "recovering", {"title": f"Copilot has remote control: driving {rid} to workshop bay {bay}", "by": by,
                                                   "model": source, "detail": ((ans or {}).get("note") or "limp speed 0.4 m/s on a degraded lidar") + spare_note},
                              bay=cell, spare=spare["id"] if spare else None, deadline=now + 180,
                              tokens=case["tokens"] + tokens)
         else:
             await self._send_tech(case, diag, ans, source, tokens)
 
-    def _tech(self, name: str | None) -> dict:
+    def _tech(self, name: str | None, fault: str = "") -> dict:
         team = (self.rt.site or {}).get("associates", [])
         pick = next((a for a in team if name and a["name"] == name), None)
-        pick = pick or next((a for a in team if "maint" in a["role"].lower()), None) or (team[0] if team else None)
-        return pick or {"name": "Maintenance technician", "role": "Maintenance tech"}
+        want = "tyre" if fault == "tire" else "maint"
+        pick = pick or next((a for a in team if want in a["role"].lower()), None) \
+            or next((a for a in team if "fitter" in a["role"].lower() or "maint" in a["role"].lower()), None) \
+            or (team[0] if team else None)
+        return pick or {"name": "Maintenance fitter", "role": "Maintenance fitter"}
 
     async def _send_tech(self, case: dict, diag: dict, ans: dict | None, source: str, tokens: int) -> None:
         frame, rid = self.rt.frame, case["robot_id"]
         r = self._robot(rid)
         target = beside(frame, cell_of(r)) if r else TOOL_CRIB
         route = walk_route(TOOL_CRIB, target, frame)
-        tech = self._tech((ans or {}).get("technician"))
+        tech = self._tech((ans or {}).get("technician"), diag.get("fault", ""))
         by = "copilot" if ans and tech["name"] == ans.get("technician") else "rules"
         now = time.time()
-        walk = max(3.0, (len(route) - 1) / WALK_MPS)
-        order = (ans or {}).get("work_order") or f"Replace the {diag['component']} on {rid}, check the wheel hub, test drive 2 m."
+        walk = max(3.0, (len(route) - 1) / UTE_CELLS_PER_S)
+        order = (ans or {}).get("work_order") or f"Change the {diag['component']} on {rid}, check the rim and wheel motor, test drive 20 m."
         await self._save(case, "dispatched", {"title": f"{tech['name']} ({tech['role']}) dispatched to {rid}", "by": by,
                                               "model": source, "detail": f"work order: {order[:300]} · ETA {walk:.0f} s"},
                          technician={"name": tech["name"], "role": tech["role"], "route": route, "depart_at": now,
@@ -428,10 +446,10 @@ class ServiceDesk:
         frame = self.rt.frame
         target = beside(frame, tuple(case["bay"]))
         route = walk_route(TOOL_CRIB, target, frame)
-        tech = self._tech(None)
+        tech = self._tech(None, "sensor")
         now = time.time()
-        walk = max(2.0, (len(route) - 1) / WALK_MPS)
-        await self._save(case, "in_repair", {"title": f"In bay G{list(map(list, W.garage)).index(list(case['bay'])) + 1}: {tech['name']} recalibrating the lidar",
+        walk = max(2.0, (len(route) - 1) / UTE_CELLS_PER_S)
+        await self._save(case, "in_repair", {"title": f"In workshop bay G{list(map(list, W.garage)).index(list(case['bay'])) + 1}: {tech['name']} recalibrating the lidar",
                                              "by": "fleet", "detail": "parked under remote control; the fleet carries on with the spare"},
                          technician={"name": tech["name"], "role": tech["role"], "route": route, "depart_at": now,
                                      "arrive_at": now + walk, "repair_until": now + walk + SENSOR_REPAIR_S,
@@ -444,13 +462,13 @@ class ServiceDesk:
         await self.rt.sim.service(case["robot_id"], "repair", None, t.get("name", "technician"))
         await self.rt.sim.service(case["robot_id"], "standby", None, "copilot")
         await self._save(case, "resolved", {"title": f"Fixed and marked done by {t.get('name')}", "by": "technician",
-                                            "detail": f"{case['robot_id']} is the new standby trailer in its bay"})
+                                            "detail": f"{case['robot_id']} is the new standby truck in its bay"})
 
     async def _dispatched(self, case: dict) -> None:
         t = case["technician"] or {}
         if time.time() < t.get("arrive_at", 0):
             return
-        await self._save(case, "repairing", {"title": f"{t.get('name')} on site: replacing the {case['component'] or 'tire'}",
+        await self._save(case, "repairing", {"title": f"{t.get('name')} on site: changing the {case['component'] or 'tyre'}",
                                              "by": "technician", "detail": t.get("work_order", "")},
                          technician={**t, "repair_until": time.time() + TIRE_REPAIR_S})
 
@@ -459,7 +477,7 @@ class ServiceDesk:
         if time.time() < t.get("repair_until", 0):
             return
         await self.rt.sim.service(case["robot_id"], "repair", None, t.get("name", "technician"))
-        await self._save(case, "resolved", {"title": f"Tire replaced, marked done by {t.get('name')}", "by": "technician",
+        await self._save(case, "resolved", {"title": f"Tyre changed, marked done by {t.get('name')}", "by": "technician",
                                             "detail": f"{case['robot_id']} is back in service"})
 
     async def mark_done(self, cid: int, user: str) -> dict:

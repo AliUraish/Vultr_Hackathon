@@ -15,9 +15,9 @@ def cases():
     out = []
     for case in CASES:
         d = Driver(seed=case.seed, job_seed=case.seed)
-        d.run(300)
-        d.sim.request_chaos(case.scenario, wait_ticks=600)
-        found = d.run(2500, stop=lambda fs, c=case: any(f["type"] == c.failure for f in fs))
+        d.run(400)
+        d.sim.request_chaos(case.scenario, wait_ticks=1200)
+        found = d.run(3500, stop=lambda fs, c=case: any(f["type"] == c.failure for f in fs))
         failure = next(f for f in found if f["type"] == case.failure)
         cap = d.cut(failure)
         variants = xp.make_variants(cap, N, 0)
@@ -65,20 +65,20 @@ def test_right_fix_is_robust_and_wrong_fix_is_not(cases):
 def test_speed_caps_cost_throughput(cases):
     case, cap, _, variants, base = cases[0]
     rules = xp.baseline_rules(cap)
-    slow = xp.aggregate(variants, base, [xp.run_variant(cap, rules + ["speed_cap(racks, 0.4)"], v) for v in variants])
-    fast = xp.aggregate(variants, base, [xp.run_variant(cap, rules + ["speed_cap(racks, 1.0)"], v) for v in variants])
+    slow = xp.aggregate(variants, base, [xp.run_variant(cap, rules + ["speed_cap(benches, 10)"], v) for v in variants])
+    fast = xp.aggregate(variants, base, [xp.run_variant(cap, rules + ["speed_cap(benches, 35)"], v) for v in variants])
     assert slow["cost_pct"] > fast["cost_pct"] > 0
     assert slow["robustness"] > fast["robustness"]
 
 
 def test_sweep_and_pick():
-    assert xp.sweep("speed_cap(racks, 0.6)", [0.5, 0.7, 0.7]) == ["speed_cap(racks, 0.5)", "speed_cap(racks, 0.7)"]
-    assert len(xp.sweep("min_clearance(0.3)")) >= 5
-    assert xp.setting("speed_cap(racks, 0.8)") == 0.8 and xp.setting("respect_closures(*)") is None
+    assert xp.sweep("speed_cap(benches, 20)", [15, 25, 25]) == ["speed_cap(benches, 15)", "speed_cap(benches, 25)"]
+    assert len(xp.sweep("min_clearance(6)")) >= 5
+    assert xp.setting("speed_cap(benches, 30)") == 30 and xp.setting("respect_closures(*)") is None
     with pytest.raises(PolicyError):
-        xp.sweep("respect_closures(racks)")
+        xp.sweep("respect_closures(benches)")
     with pytest.raises(PolicyError):
-        xp.sweep("speed_cap(racks, 0.6)", [9.0])
+        xp.sweep("speed_cap(benches, 20)", [90.0])
     pts = [{"fix": "a", "robustness": 1.0, "cost_pct": 30.0}, {"fix": "b", "robustness": 0.96, "cost_pct": 12.0},
            {"fix": "c", "robustness": 0.8, "cost_pct": 5.0}]
     assert xp.pick_setting(pts, 0.95)["fix"] == "b"
@@ -91,7 +91,7 @@ def test_isolate_finds_the_minimal_cause(cases):
         assert res["ok"] and res["tested"] <= 90 and res["summary"]
         kinds = {m["kind"] for m in res["minimal"]}
         assert "chaos" in kinds, case.scenario  # the injected hazard is always part of the cause
-        if case.scenario != "pallet_drop":  # a mislabel or a closed aisle needs just one job to meet it
+        if case.scenario != "rockfall":  # a grade mix-up or a closed road needs just one load to meet it
             assert len(res["minimal"]) < res["total"]
 
 

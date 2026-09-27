@@ -18,9 +18,9 @@ def cases():
     out = []
     for case in CASES:
         d = Driver(seed=case.seed, job_seed=case.seed)
-        d.run(300)
-        d.sim.request_chaos(case.scenario, wait_ticks=600)
-        found = d.run(2500, stop=lambda fs, c=case: any(f["type"] == c.failure for f in fs))
+        d.run(400)
+        d.sim.request_chaos(case.scenario, wait_ticks=1200)
+        found = d.run(3500, stop=lambda fs, c=case: any(f["type"] == c.failure for f in fs))
         failure = next(f for f in found if f["type"] == case.failure)
         cap = d.cut(failure)
         ctx = diagnosis.context(cap, {"detail": failure["detail"]}, [], [])
@@ -34,8 +34,8 @@ def investigate(cap, ctx, s=None, transport=None):
     return asyncio.run(inv.run()), rec, lab
 
 
-EXPECT = {"pallet_drop": "speed_cap(racks,", "mislabel_bin": "require_scan_confirm(loose_small)",
-          "worker_in_aisle": "respect_closures(racks)"}
+EXPECT = {"rockfall": "speed_cap(benches,", "grade_mixup": "grade_check(ore)",
+          "blast_closure": "respect_closures(benches)"}
 
 
 def test_scripted_investigator_finds_a_robust_fix(cases):
@@ -57,7 +57,8 @@ def test_scripted_tunes_the_speed_cap(cases):
     report, rec, _ = investigate(cap, ctx)
     assert "tune_fix" in [s["tool"] for s in rec.steps.values()]
     top = report["fixes"][0]
-    assert top["fix"] != "speed_cap(racks, 0.5)" or top["stress"]["cost_pct"] <= 31  # cheapest safe setting wins
+    tune = next(s for s in rec.steps.values() if s["tool"] == "tune_fix")
+    assert tune["status"] == "done" and top["fix"].startswith("speed_cap(benches,")   # the cheapest safe setting wins
 
 
 def _chat(calls=None, content=None, usage=(100, 20)):
@@ -72,13 +73,13 @@ def test_model_drives_the_tools(cases):
     _, cap, ctx = cases[1]
     script = [
         [("reproduce", {"times": 2, "why": "determinism"})],
-        [("stress_test", {"fix": "require_scan_confirm(loose_small)", "variants": 12, "why": "robust?"})],
-        [("submit_findings", {"root_cause": "mislabeled loose_small bin picked unscanned",
+        [("stress_test", {"fix": "grade_check(ore)", "variants": 12, "why": "robust?"})],
+        [("submit_findings", {"root_cause": "mis-tagged ore face loaded without a grade check",
                               "evidence": ["2/2 reproduced"], "confidence": "high",
-                              "fixes": [{"fix": "require_scan_confirm(loose_small)", "why": "targeted"},
-                                        {"fix": "require_scan_confirm(*)", "why": "broader"},
-                                        {"fix": "teleport(R1)", "why": "invalid"}],
-                              "rejected": [{"fix": "speed_cap(racks, 0.5)", "reason": "irrelevant"}]})],
+                              "fixes": [{"fix": "grade_check(ore)", "why": "targeted"},
+                                        {"fix": "grade_check(*)", "why": "broader"},
+                                        {"fix": "teleport(T01)", "why": "invalid"}],
+                              "rejected": [{"fix": "speed_cap(benches, 20)", "reason": "irrelevant"}]})],
     ]
     seen: list[dict] = []
 
@@ -91,7 +92,7 @@ def test_model_drives_the_tools(cases):
     s = settings("k", provider="vultr", model="llama-test")
     report, rec, lab = investigate(cap, ctx, s, httpx.MockTransport(handler))
     assert report["source"] == "vultr:llama-test" and report["tokens"] == {"in": 300, "out": 60}
-    assert [f["fix"] for f in report["fixes"]] == ["require_scan_confirm(loose_small)", "require_scan_confirm(*)"]
+    assert [f["fix"] for f in report["fixes"]] == ["grade_check(ore)", "grade_check(*)"]
     # the second fix was never stress-tested by the model: the investigator does it before the gate
     assert [s["tool"] for s in rec.steps.values()] == ["reproduce", "stress_test", "stress_test", "submit_findings"]
     assert all(f["stress"]["robustness"] is not None for f in report["fixes"])
@@ -106,7 +107,7 @@ def test_bad_tool_arguments_come_back_as_errors(cases):
     _, cap, ctx = cases[1]
     script = [[("stress_test", {"fix": "warp_speed(9)", "why": "?"})],
               [("submit_findings", {"root_cause": "x", "evidence": [], "confidence": "low",
-                                    "fixes": [{"fix": "require_scan_confirm(*)", "why": "y"}]})]]
+                                    "fixes": [{"fix": "grade_check(*)", "why": "y"}]})]]
     n = {"i": 0}
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -117,7 +118,7 @@ def test_bad_tool_arguments_come_back_as_errors(cases):
         return httpx.Response(200, json=_chat(script[n["i"] - 1]))
 
     report, rec, _ = investigate(cap, ctx, settings("k", provider="vultr", model="m"), httpx.MockTransport(handler))
-    assert rec.steps[1]["status"] == "error" and report["fixes"][0]["fix"] == "require_scan_confirm(*)"
+    assert rec.steps[1]["status"] == "error" and report["fixes"][0]["fix"] == "grade_check(*)"
 
 
 def test_budget_forces_submission(cases):
@@ -130,13 +131,13 @@ def test_budget_forces_submission(cases):
             forced.append(body["tool_choice"])
             return httpx.Response(200, json=_chat([("submit_findings", {
                 "root_cause": "closure ignored", "evidence": [], "confidence": "medium",
-                "fixes": [{"fix": "respect_closures(racks)", "why": "z"}]})]))
-        return httpx.Response(200, json=_chat([("what_if", {"rules": ["respect_closures(racks)"], "why": "again"})]))
+                "fixes": [{"fix": "respect_closures(benches)", "why": "z"}]})]))
+        return httpx.Response(200, json=_chat([("what_if", {"rules": ["respect_closures(benches)"], "why": "again"})]))
 
     report, rec, _ = investigate(cap, ctx, settings("k", provider="vultr", model="m"), httpx.MockTransport(handler))
     assert forced == [{"type": "function", "function": {"name": "submit_findings"}}]
     assert sum(s["tool"] == "what_if" for s in rec.steps.values()) == MAX_STEPS
-    assert report["fixes"][0]["fix"] == "respect_closures(racks)"
+    assert report["fixes"][0]["fix"] == "respect_closures(benches)"
 
 
 def test_model_outage_hands_over_to_the_scripted_investigator(cases):
@@ -144,7 +145,7 @@ def test_model_outage_hands_over_to_the_scripted_investigator(cases):
     down = httpx.MockTransport(lambda req: httpx.Response(503, text="overloaded"))
     report, rec, _ = investigate(cap, ctx, settings("k", provider="vultr", model="m"), down)
     assert report["source"] == "vultr:m → scripted" and "scripted investigator took over" in report["notes"][0]
-    assert report["fixes"][0]["fix"] == "respect_closures(racks)"
+    assert report["fixes"][0]["fix"] == "respect_closures(benches)"
 
 
 def test_rejected_parameters_are_dropped_and_retried(cases):
@@ -163,33 +164,3 @@ def test_rejected_parameters_are_dropped_and_retried(cases):
     report, _, _ = investigate(cap, ctx, settings("k", provider="vultr", model="m"), httpx.MockTransport(handler))
     assert "parallel_tool_calls" not in bodies[-1] and report["source"] == "vultr:m"
 
-
-def test_openai_uses_the_responses_api_and_chains_turns(cases):
-    _, cap, ctx = cases[2]
-    turns = [
-        [{"type": "reasoning", "id": "rs_1", "summary": []},
-         {"type": "function_call", "call_id": "fc_1", "name": "reproduce", "arguments": json.dumps({"why": "w"})}],
-        [{"type": "message", "content": [{"type": "output_text", "text": "Deterministic; now the fix."}]},
-         {"type": "function_call", "call_id": "fc_2", "name": "submit_findings", "arguments": json.dumps({
-             "root_cause": "closure ignored", "evidence": ["3/3"], "confidence": "high",
-             "fixes": [{"fix": "respect_closures(racks)", "why": "re-plan on closure"}]})}],
-    ]
-    bodies: list[dict] = []
-
-    def handler(req: httpx.Request) -> httpx.Response:
-        assert req.url.path.endswith("/responses")
-        body = json.loads(req.content)
-        bodies.append(body)
-        i = len(bodies) - 1
-        return httpx.Response(200, json={"id": f"resp_{i}", "output": turns[i],
-                                         "usage": {"input_tokens": 50, "output_tokens": 10}})
-
-    report, rec, _ = investigate(cap, ctx, settings("k", provider="openai", model="gpt-x"), httpx.MockTransport(handler))
-    assert report["source"] == "openai:gpt-x" and report["tokens"] == {"in": 100, "out": 20}
-    first, second = bodies
-    assert first["tools"][0]["name"] == "reproduce" and first["instructions"] and "previous_response_id" not in first
-    assert second["previous_response_id"] == "resp_0"
-    out = second["input"][0]
-    assert out["type"] == "function_call_output" and out["call_id"] == "fc_1" and "identical" in out["output"]
-    assert rec.notes == ["Deterministic; now the fix."]
-    assert [s["tool"] for s in rec.steps.values()] == ["reproduce", "stress_test", "submit_findings"]

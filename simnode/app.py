@@ -1,8 +1,8 @@
 """Sim node entry point on VM B:  uvicorn simnode.app:app --host 0.0.0.0 --port 8100
 
-Runs the live fleet at a fixed 10 Hz, exposes the fleet API the control plane
-dispatches through (goto / pick / drop / scan, chaos, policy hot-reload), and
-streams every tick to the control plane. Telemetry is buffered, so a control
+Runs the live haul fleet at a fixed 10 Hz, exposes the fleet API the control plane
+dispatches through (goto / load / dump / grade check, hazards, right-of-way rulings,
+service moves, policy hot-reload), and streams every tick to the control plane. Telemetry is buffered, so a control
 plane restart does not punch holes in the flight recorder.
 """
 from __future__ import annotations
@@ -121,7 +121,7 @@ class Node:
             where = f" ({', '.join(f'{k}={v}' for k, v in req.hints.items())})" if req.hints else ""
             self.notices.append({"type": "chaos_expired", "tick": rec.tick, "request": req.id,
                                  "scenario": req.scenario, "hints": req.hints,
-                                 "message": f"{req.scenario}: no robot got into position{where}"})
+                                 "message": f"{req.scenario}: no truck got into position{where}"})
         self.sim.expired.clear()
         while len(self.outbox) > MAX_BUFFER_TICKS:
             self.outbox.popleft()
@@ -250,6 +250,29 @@ class Service(BaseModel):
     by: str = ""
 
 
+class Traffic(BaseModel):
+    robot: str
+    to: str
+    op: str = "yield"
+    reason: str = ""
+    by: str = ""
+
+
+class Advice(BaseModel):
+    robot: str
+    cap: int                      # mm/tick
+    ttl: int = 150
+    reason: str = ""
+    by: str = ""
+
+
+class Road(BaseModel):
+    id: str
+    op: str = "repair"
+    crew: str = ""
+    by: str = ""
+
+
 class Block(BaseModel):
     n: int
     hash: str
@@ -278,7 +301,7 @@ def _check_steps(steps: list[dict]) -> None:
 @app.post("/fleet/robots/{rid}/commands", dependencies=Auth)
 async def commands(rid: str, body: Commands, node: Node = Depends(get_node)) -> dict:
     if rid not in W.robot_caps:
-        raise HTTPException(404, f"no robot {rid}")
+        raise HTTPException(404, f"no truck {rid}")
     _check_steps(body.steps)
     inp = {"kind": "cmd", "robot": rid, "steps": body.steps}
     if body.job:
@@ -326,9 +349,9 @@ async def policy(body: Policy, node: Node = Depends(get_node)) -> dict:
 
 @app.post("/fleet/service", dependencies=Auth)
 async def service(body: Service, node: Node = Depends(get_node)) -> dict:
-    """Service control for a faulted or standby robot: move (remote), standby, deploy, repair."""
+    """Service control for a faulted or standby truck: move (remote), standby, deploy, repair."""
     if body.robot not in W.robot_caps:
-        raise HTTPException(404, f"no robot {body.robot}")
+        raise HTTPException(404, f"no truck {body.robot}")
     if body.op not in ("move", "standby", "deploy", "repair"):
         raise HTTPException(400, "op must be move, standby, deploy or repair")
     if body.op == "move" and not (body.cell and len(body.cell) == 2 and W.passable((body.cell[0], body.cell[1]))):
@@ -338,6 +361,39 @@ async def service(body: Service, node: Node = Depends(get_node)) -> dict:
         inp["cell"] = [body.cell[0], body.cell[1]]
     assert node.sim is not None
     return {"input_id": node.sim.submit(inp), "tick": node.sim.tick_no}
+
+
+@app.post("/fleet/traffic", dependencies=Auth)
+async def traffic(body: Traffic, node: Node = Depends(get_node)) -> dict:
+    """A right-of-way ruling from the control plane's traffic desk: `robot` yields to `to`."""
+    if body.robot not in W.robot_caps or body.to not in W.robot_caps or body.robot == body.to:
+        raise HTTPException(400, "two different trucks, please")
+    if body.op != "yield":
+        raise HTTPException(400, "op must be yield")
+    assert node.sim is not None
+    return {"input_id": node.sim.submit({"kind": "traffic", "robot": body.robot, "to": body.to, "op": "yield",
+                                         "reason": body.reason[:240], "by": body.by[:80]}),
+            "tick": node.sim.tick_no}
+
+
+@app.post("/fleet/advice", dependencies=Auth)
+async def advice(body: Advice, node: Node = Depends(get_node)) -> dict:
+    """Speed advice from a truck's AI driver on the control plane (recorded, so replays stay exact)."""
+    if body.robot not in W.robot_caps:
+        raise HTTPException(400, "unknown truck")
+    assert node.sim is not None
+    return {"input_id": node.sim.submit({"kind": "advice", "robot": body.robot, "cap": int(body.cap), "ttl": int(body.ttl),
+                                         "reason": body.reason[:160], "by": body.by[:80]}), "tick": node.sim.tick_no}
+
+
+@app.post("/fleet/road", dependencies=Auth)
+async def road(body: Road, node: Node = Depends(get_node)) -> dict:
+    """A road repair the road-crew AI ordered has been done."""
+    if body.op != "repair" or not body.id.startswith("H"):
+        raise HTTPException(400, "op must be repair, id a road feature")
+    assert node.sim is not None
+    return {"input_id": node.sim.submit({"kind": "road", "op": "repair", "id": body.id, "crew": body.crew[:40],
+                                         "by": body.by[:80]}), "tick": node.sim.tick_no}
 
 
 @app.post("/fleet/witness", dependencies=Auth)

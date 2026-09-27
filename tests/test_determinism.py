@@ -13,16 +13,17 @@ from replay_core.hashing import clone
 from replay_core.state import state_hash
 from tests.driver import Driver
 
-TICKS = 900
+TICKS = 1200
 
 
 def _fleet(seed: int = 3) -> Driver:
     d = Driver(seed=seed, job_seed=3)
-    d.run(200)
-    d.sim.request_chaos("pallet_drop")
-    d.run(200)
-    d.sim.request_chaos("mislabel_bin")
-    d.run(TICKS - 400)
+    d.run(350)
+    d.sim.request_chaos("rockfall")
+    d.run(250)
+    d.sim.request_chaos("grade_mixup")
+    d.sim.request_chaos("road_damage")
+    d.run(TICKS - 600)
     return d
 
 
@@ -43,7 +44,7 @@ def test_seed_matters(fleet):
 
 def test_any_snapshot_restores_and_replays_hash_for_hash(fleet):
     by_tick = {r["tick"]: r for r in fleet.records}
-    for snap_tick in (0, 250, 500):
+    for snap_tick in (0, 350, 700):
         state = clone(fleet.snapshots[snap_tick])
         for t in range(snap_tick, TICKS):
             step(state, clone(by_tick[t + 1]["inputs"]))

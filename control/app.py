@@ -27,7 +27,10 @@ from replay_core.world import TICK_HZ, W
 
 from replay_core.signing import Signer
 
-from . import assistant, auth, db, enterprise, fleet, ingest, ledger, platform, policies, service
+from . import assistant, auth, db, enterprise, fleet, ingest, ledger, policies, service
+from .aiops import AIOps
+from .traffic import TrafficDesk
+from .usage import USAGE
 from .bus import Hub
 from .config import load
 from .lab import Lab, LabError
@@ -57,7 +60,7 @@ async def _retention(rt: Runtime) -> None:
 
 
 async def _provision_site(rt: Runtime) -> None:
-    """First boot of a database: the model writes the enterprise profile (a minute at most)."""
+    """First boot of a database: the model writes the mine's profile (a minute at most)."""
     for attempt in range(5):
         try:
             rt.site = await enterprise.ensure_site(rt.pool, rt.settings)
@@ -90,10 +93,13 @@ async def lifespan(app: FastAPI):
     rt.lab = Lab(rt)
     rt.signer = signer
     rt.service = service.ServiceDesk(rt)
+    rt.traffic = TrafficDesk(rt)
+    rt.aiops = AIOps(rt)
+    await USAGE.attach(pool, rt.hub)
     app.state.settings, app.state.rt = settings, rt
     tasks = [asyncio.create_task(rt.orchestrator.loop()), asyncio.create_task(fleet.loop(rt)),
              asyncio.create_task(_retention(rt)), asyncio.create_task(ledger.loop(rt)),
-             asyncio.create_task(_provision_site(rt)), asyncio.create_task(rt.service.loop())]
+             asyncio.create_task(_provision_site(rt)), asyncio.create_task(rt.service.loop()), *rt.aiops.tasks()]
     try:
         yield
     finally:
@@ -273,8 +279,11 @@ async def state(user: str = User, rt: Runtime = Depends(get_rt)) -> dict:
                              "WHERE status IN ('pending', 'assigned', 'active') ORDER BY created_at")
         inbox = await c.fetchval("SELECT count(*) FROM failures WHERE status <> ALL($1::text[])",
                                  ["fixed", "dismissed", "lost"])
+    s = rt.settings
     return {**rt.status(), "policy": {"version": pol["version"], "rules": pol["rules"], "hash": pol["hash"],
                                       "signed": bool(pol.get("signature")), "key_id": pol.get("key_id")},
+            "ai": {"enabled": s.inference_enabled, "provider": s.inference_provider if s.inference_enabled else "rules",
+                   "model": (s.inference_model or "auto") if s.inference_enabled else None},
             "site": {"code": rt.site["code"], "name": rt.site["name"], "company": rt.site["facility"]["company"]}
             if rt.site else None,
             "frame": ui_frame(rt.frame) if rt.frame else None, "jobs": db.rows(jobs), "open_failures": inbox}
@@ -424,13 +433,13 @@ async def dismiss(fid: int, user: str = User, rt: Runtime = Depends(get_rt)) -> 
 
 @app.post("/api/failures/{fid}/reinject")
 async def reinject(fid: int, user: str = User, rt: Runtime = Depends(get_rt)) -> dict:
-    """Recreate the original situation live: same aisle and gap, same item class, same aisle closed."""
+    """Recreate the original situation live: same bench and gap, same material, same road closed."""
     async with rt.pool.acquire() as c:
         f = await c.fetchrow("SELECT f.run_id, f.type, f.tick, f.scenario, k.blob->'inputs' AS inputs "
                              "FROM failures f LEFT JOIN capsules k ON k.failure_id = f.id WHERE f.id = $1", fid)
         original = await original_chaos(c, f["run_id"], f["type"], f["tick"], f["inputs"]) if f else None
     if f is None or not f["scenario"] or not original:
-        raise HTTPException(409, "this failure was not caused by a canned scenario")
+        raise HTTPException(409, "this failure was not caused by an injected hazard")
     hints = reinject_hints(original)
     try:
         res = await rt.sim.chaos(f["scenario"], hints, wait_ticks=900)
@@ -553,15 +562,15 @@ async def kpis(user: str = User, rt: Runtime = Depends(get_rt)) -> dict:
 class AskBody(BaseModel):
     question: str = Field(min_length=1, max_length=600)
     scope: str = Field(default="site", pattern="^(robot|site)$")
-    robot: str | None = Field(default=None, pattern="^R[0-9]{1,2}$")
+    robot: str | None = Field(default=None, pattern="^T[0-9]{2}$")
     history: list[dict] = Field(default_factory=list, max_length=12)
 
 
 @app.post("/api/ask")
 async def ask(body: AskBody, user: str = User, rt: Runtime = Depends(get_rt)) -> dict:
-    """The operations copilot: a question about one robot or the whole site, answered from live data."""
+    """The operations copilot: a question about one truck or the whole pit, answered from live data."""
     if body.scope == "robot" and not body.robot:
-        raise HTTPException(400, "which robot?")
+        raise HTTPException(400, "which truck?")
     try:
         return await assistant.ask(rt, user, body.question, body.scope, body.robot if body.scope == "robot" else None,
                                    body.history)
@@ -571,13 +580,13 @@ async def ask(body: AskBody, user: str = User, rt: Runtime = Depends(get_rt)) ->
 
 @app.get("/api/service")
 async def service_cases(user: str = User, rt: Runtime = Depends(get_rt)) -> list[dict]:
-    """Open trailer service cases, and the ones resolved in the last 10 minutes."""
+    """Open truck service cases, and the ones resolved in the last 10 minutes."""
     return await service.open_cases(rt.pool)
 
 
 @app.post("/api/service/{cid}/done")
 async def service_done(cid: int, user: str = User, rt: Runtime = Depends(get_rt)) -> dict:
-    """The operator marks a technician's repair done (the technician normally does)."""
+    """The controller marks a fitter's repair done (the fitter normally does)."""
     try:
         return await rt.service.mark_done(cid, user)
     except ValueError as exc:
@@ -586,17 +595,37 @@ async def service_done(cid: int, user: str = User, rt: Runtime = Depends(get_rt)
 
 @app.get("/api/robots/{rid}/events")
 async def robot_events(rid: str, limit: int = 40, user: str = User, rt: Runtime = Depends(get_rt)) -> list[dict]:
-    """A robot's recent activity in the current run, newest first (backfills the live log)."""
+    """A truck's recent activity in the current run, newest first (backfills the live log)."""
     async with rt.pool.acquire() as c:
         return db.rows(await c.fetch(
             "SELECT id, tick, type, payload FROM events WHERE run_id = $1 AND robot_id = $2 "
-            "AND (type LIKE 'sim.%' OR type IN ('dispatch', 'failure', 'input.chaos')) ORDER BY id DESC LIMIT $3",
+            "AND (type LIKE 'sim.%' OR type IN ('dispatch', 'ai.dispatch', 'ai.traffic', 'traffic.rule', 'failure', "
+            "'input.chaos')) ORDER BY id DESC LIMIT $3",
             rt.run_id, rid, max(1, min(limit, 200))))
 
 
-@app.get("/api/platform")
-async def platform_view(user: str = User, rt: Runtime = Depends(get_rt)) -> dict:
-    return await platform.snapshot(rt)
+@app.get("/api/decisions")
+async def decisions(user: str = User, rt: Runtime = Depends(get_rt)) -> list[dict]:
+    """Recent dispatch, traffic and service decisions (AI or rules), oldest first."""
+    return list(rt.decisions)
+
+
+@app.get("/api/ai")
+async def ai_status(user: str = User, rt: Runtime = Depends(get_rt)) -> dict:
+    """The AI agents running the pit (drivers, auditor, road crew, supervisor, hazards, autopilot) and what the
+    Vultr Serverless Inference calls behind them cost."""
+    return rt.aiops.status() if rt.aiops else {"usage": USAGE.snapshot()}
+
+
+@app.get("/api/ai/usage")
+async def ai_usage(hours: int = 60, user: str = User, rt: Runtime = Depends(get_rt)) -> dict:
+    return {**USAGE.snapshot(), "hourly": await USAGE.history(max(1, min(168, hours)))}
+
+
+@app.get("/api/faces")
+async def faces(user: str = User, rt: Runtime = Depends(get_rt)) -> dict:
+    """Each dig face: trucks on their way or under the excavator, and how long it has been left alone."""
+    return rt.faces
 
 
 @app.get("/api/audit")
