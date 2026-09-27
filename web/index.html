@@ -3,194 +3,55 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Replay · Fleet Ops</title>
+  <meta name="theme-color" content="#000000">
+  <title>Replay · Fleet Incident Lab</title>
   <link rel="stylesheet" href="/static/style.css">
+  <script type="importmap">{"imports": {"three": "/static/vendor/three/three.module.min.js", "three/addons/": "/static/vendor/three/addons/"}}</script>
 </head>
 <body>
   <header class="topbar">
-    <div class="brand"><span class="logo">⟲</span> Replay <span class="sub">fleet ops</span></div>
+    <div class="brand" id="brand"><span class="logo">⟲</span> Replay <span class="sub" id="site-chip">fleet incident lab</span></div>
     <nav id="nav">
-      <a href="#/floor" data-view="floor">Floor</a>
-      <a href="#/inbox" data-view="inbox">Failures <span id="inbox-badge" class="badge" hidden></span></a>
-      <a href="#/regression" data-view="regression">Regression suite</a>
+      <a href="#/live" data-view="live">Live</a>
+      <a href="#/floor" data-view="floor">Map</a>
+      <a href="#/incidents" data-view="incidents">Incidents<span id="inbox-badge" class="badge" hidden></span></a>
+      <a href="#/regression" data-view="regression">Regression</a>
       <a href="#/log" data-view="log">Event log</a>
       <a href="#/policy" data-view="policy">Policy</a>
+      <a href="#/platform" data-view="platform">Platform</a>
     </nav>
     <div class="status">
       <span id="policy-chip" class="chip mono">policy –</span>
       <span id="sim-chip" class="chip"><span class="dot"></span><span id="sim-text">sim offline</span></span>
-      <span id="tick-chip" class="chip mono">t –</span>
-      <button id="logout" class="ghost small">Sign out</button>
+      <span class="chip mono">t <span id="tick-num" data-v="0">–</span></span>
+      <button id="logout" style="height:28px;padding:0 11px;font-size:12px">Sign out</button>
     </div>
   </header>
 
   <main>
-    <!-- Floor -->
-    <section id="view-floor" class="view">
-      <div class="floor-layout">
-        <div class="panel map-panel">
-          <canvas id="floor-canvas" class="floor"></canvas>
-          <div class="legend" id="legend"></div>
-        </div>
-        <aside class="side">
-          <div class="panel">
-            <h3>Inject a failure</h3>
-            <div id="chaos-buttons" class="stack"></div>
-            <p class="hint" id="chaos-hint">Each scenario waits for the floor to be in position, then fires once.</p>
-          </div>
-          <div class="panel">
-            <h3>Robots</h3>
-            <table class="compact" id="robot-table"><tbody></tbody></table>
-          </div>
-          <div class="panel">
-            <div class="row between">
-              <h3>Jobs</h3>
-              <label class="toggle"><input type="checkbox" id="auto-jobs"> auto-generate</label>
-            </div>
-            <form id="job-form" class="row">
-              <input id="job-slots" placeholder="slots, e.g. C4, A2" autocomplete="off">
-              <select id="job-dock"></select>
-              <button type="submit">Add</button>
-            </form>
-            <table class="compact" id="job-table"><tbody></tbody></table>
-          </div>
-        </aside>
-      </div>
-    </section>
-
-    <!-- Inbox -->
-    <section id="view-inbox" class="view" hidden>
-      <div class="panel">
-        <h2>Failure inbox</h2>
-        <p class="hint">Every failure the rules detect is captured as a capsule, replayed, diagnosed and tried against fixes automatically. You approve.</p>
-        <table class="grid" id="inbox-table">
-          <thead><tr><th>#</th><th>Failure</th><th>Robot</th><th>Tick</th><th>Cause</th><th>Replays</th><th>Status</th><th></th></tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-    </section>
-
-    <!-- Failure detail -->
-    <section id="view-failure" class="view" hidden>
-      <div class="failure-head">
-        <div>
-          <a href="#/inbox" class="back">← Failures</a>
-          <h2 id="f-title">Failure</h2>
-          <div id="f-sub" class="hint"></div>
-        </div>
-        <div class="actions" id="f-actions"></div>
-      </div>
-      <ol class="pipeline" id="f-pipeline"></ol>
-
-      <div class="panel">
-        <div class="row between">
-          <h3>Live vs replay</h3>
-          <div id="replay-chips" class="chips"></div>
-        </div>
-        <div class="viewer">
-          <figure><figcaption>Recorded live <span id="live-cap" class="mono hint"></span></figcaption><canvas id="live-canvas"></canvas></figure>
-          <figure><figcaption id="replay-caption">Replay</figcaption><canvas id="replay-canvas"></canvas></figure>
-        </div>
-        <div class="scrubber">
-          <button id="play" class="icon" title="Play / pause">▶</button>
-          <div class="track-wrap">
-            <input type="range" id="scrub" min="0" max="0" value="0">
-            <div id="scrub-marks" class="marks"></div>
-          </div>
-          <span id="scrub-label" class="mono">t –</span>
-          <select id="speed"><option value="1">1×</option><option value="2">2×</option><option value="4" selected>4×</option></select>
-        </div>
-        <div id="viewer-events" class="timeline-events mono"></div>
-      </div>
-
-      <div class="panel">
-        <div class="row between">
-          <h3>Diagnosis and fix trials</h3>
-          <span id="diag-source" class="hint"></span>
-        </div>
-        <div id="hypotheses" class="hyp-grid"></div>
-      </div>
-
-      <div class="panel">
-        <h3>Audit trail <span class="hint">(every step, from the event log on Vultr)</span></h3>
-        <ol id="chain" class="chain mono"></ol>
-      </div>
-    </section>
-
-    <!-- Regression -->
-    <section id="view-regression" class="view" hidden>
-      <div class="panel">
-        <div class="row between">
-          <h2>Regression suite</h2>
-          <button id="run-suite">Re-check all against current policy</button>
-        </div>
-        <p class="hint">Every approved fix leaves its capsule here. A new fix must keep all of them clean before it can ship.</p>
-        <table class="grid" id="suite-table">
-          <thead><tr><th>Capsule</th><th>Failure</th><th>Fixed by</th><th>Policy</th><th>Latest check</th><th>Hash</th></tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-    </section>
-
-    <!-- Event log -->
-    <section id="view-log" class="view" hidden>
-      <div class="log-layout">
-        <div class="panel">
-          <h3>Rewind the floor</h3>
-          <canvas id="log-canvas" class="floor"></canvas>
-          <div class="scrubber">
-            <input type="range" id="log-scrub" min="0" max="0" value="0">
-            <span id="log-tick" class="mono">t –</span>
-          </div>
-          <p class="hint">Every tick of the fleet is stored in Postgres on VM A. Drag to any moment, or click an event.</p>
-        </div>
-        <div class="panel">
-          <div class="row between">
-            <h3>Event log</h3>
-            <select id="log-filter">
-              <option value="">everything</option>
-              <option value="failure">failures</option>
-              <option value="capsule">capsules</option>
-              <option value="replay">replays</option>
-              <option value="diagnosis">diagnosis</option>
-              <option value="hypothesis">hypotheses</option>
-              <option value="approval">approvals</option>
-              <option value="policy">policy</option>
-              <option value="dispatch">dispatch</option>
-              <option value="input.chaos">chaos</option>
-              <option value="sim.">sim events</option>
-            </select>
-          </div>
-          <ol id="log-list" class="log mono"></ol>
-          <button id="log-more" class="ghost">Older</button>
-        </div>
-      </div>
-    </section>
-
-    <!-- Policy -->
-    <section id="view-policy" class="view" hidden>
-      <div class="panel">
-        <h2>Fleet policy versions</h2>
-        <p class="hint">Each version is the previous one plus one approved fix. Robots hot-reload it on the next tick.</p>
-        <table class="grid" id="policy-table">
-          <thead><tr><th>Version</th><th>Added fix</th><th>Full policy</th><th>Approved by</th><th>From capsule</th><th>Hash</th><th>When</th></tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-    </section>
+    <section id="view-live" hidden></section>
+    <section id="view-floor" hidden></section>
+    <section id="view-incidents" hidden></section>
+    <section id="view-incident" hidden></section>
+    <section id="view-regression" hidden></section>
+    <section id="view-log" hidden></section>
+    <section id="view-policy" hidden></section>
+    <section id="view-platform" hidden></section>
   </main>
 
+  <aside id="inspector" class="drawer"></aside>
+
   <div id="login" class="overlay" hidden>
-    <form id="login-form" class="panel login">
-      <h2>⟲ Replay</h2>
-      <p class="hint">Fleet operations sign-in</p>
+    <form id="login-form" class="panel login glow">
+      <div class="brand"><span class="logo">⟲</span> Replay</div>
+      <div class="hint">Fleet incident lab · sign in</div>
       <input id="login-user" placeholder="username" autocomplete="username" required>
       <input id="login-pass" type="password" placeholder="password" autocomplete="current-password" required>
-      <button type="submit">Sign in</button>
-      <p id="login-error" class="error"></p>
+      <button type="submit" class="primary">Sign in</button>
+      <div id="login-error" class="error"></div>
     </form>
   </div>
   <div id="toasts"></div>
-  <script src="/static/app.js"></script>
+  <script type="module" src="/static/js/app.js"></script>
 </body>
 </html>
